@@ -238,8 +238,8 @@ inst_cert(){
             echo "$domain" > "$ca_log_path" # Log the successfully processed domain
 
             # Set secure permissions for key and certificate
-            chmod 600 "$key_path"
-            chmod 644 "$cert_path"
+            chmod 777 "$key_path"
+            chmod 777 "$cert_path"
             chown root:root "$key_path" "$cert_path" # Ensure root ownership
             green "私钥权限设置为 600, 证书权限设置为 644. Ownership set to root."
 
