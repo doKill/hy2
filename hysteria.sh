@@ -65,14 +65,13 @@ ensure_tool() {
         if [[ ! "$SYSTEM" == "CentOS" && ! "$SYSTEM" == "Fedora" && ! "$SYSTEM" == "Rocky" && ! "$SYSTEM" == "Alma" ]]; then ${PACKAGE_UPDATE[int]}; fi
         ${PACKAGE_INSTALL[int]} "$package_name" || (red "$tool_name ($package_name) 安装失败，请手动安装后再运行脚本。" && exit 1)
         # Verify again after install attempt
-        if [[ -z $(type -P "$tool_name") ]]; then red "$tool_name 安装后仍未找到，请检查安装。" && exit 1; fi
-        green "$tool_name 安装成功。"
+        if [[ -z $(type -P "$tool_name") ]]; then red "$tool_name 安装后仍未找到 (尝试从包 $package_name 安装)。请检查安装。" && exit 1; fi
+        green "$tool_name (来自包 $package_name) 安装成功。"
     fi
 }
 
 # Ensure essential tools are available early
 ensure_tool "curl" "curl"
-# For dig:
 if [[ "$SYSTEM" == "CentOS" || "$SYSTEM" == "Fedora" || "$SYSTEM" == "Rocky" || "$SYSTEM" == "Alma" ]]; then
     ensure_tool "dig" "bind-utils"
 else
@@ -80,13 +79,16 @@ else
 fi
 ensure_tool "realpath" "coreutils"
 ensure_tool "openssl" "openssl"
-ensure_tool "qrencode" "qrencode" # For QR code generation
-ensure_tool "crontab" "cron" # Ensure crontab command exists (package name varies)
+# ensure_tool "qrencode" "qrencode" # Removed qrencode
+ensure_tool "crontab" "cron" # Package name varies, cron/cronie, ensure_tool in insthysteria handles OS specific
 ensure_tool "iptables" "iptables"
-ensure_tool "ip6tables" "iptables"
-ensure_tool "iptables-save" "iptables" # Needed for saving rules fallback
+ensure_tool "ip6tables" "iptables" # Often part of the same iptables package
+ensure_tool "iptables-save" "iptables"
 ensure_tool "ip6tables-save" "iptables"
-ensure_tool "netfilter-persistent" "iptables-persistent" # Often needs manual setup like `dpkg-reconfigure iptables-persistent` on Debian/Ubuntu first time
+# For netfilter-persistent, package is often iptables-persistent
+if [[ "$SYSTEM" == "Debian" || "$SYSTEM" == "Ubuntu" ]]; then
+    ensure_tool "netfilter-persistent" "iptables-persistent"
+fi
 
 
 realip(){
@@ -107,7 +109,7 @@ apply_cert_permissions() {
     red "证书 '$cert_file_path' 的权限建议为 644 (例如：chmod 644 '$cert_file_path')。"
     red "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
     yellow "按任意键继续并应用 777 权限，或按 Ctrl+C 中止脚本..."
-    read -n 1 -s # Wait for a single key press, silent
+    read -n 1 -s
 
     chmod 777 "$key_file_path"
     chmod 777 "$cert_file_path"
@@ -127,22 +129,21 @@ inst_cert(){
     USE_INSECURE_CLIENT_CONFIG="true"
 
     local target_cert_dir="/etc/hysteria"
-    # These will be the final paths for Hysteria config, update global cert_path & key_path
     cert_path="$target_cert_dir/cert.crt"
     key_path="$target_cert_dir/private.key"
-    local ca_log_path="$target_cert_dir/ca.log" # ACME log also in target dir
+    local ca_log_path="$target_cert_dir/ca.log"
 
-    mkdir -p "$target_cert_dir" # Ensure directory exists for all cert types
+    mkdir -p "$target_cert_dir"
 
     if [[ $certInput == 2 ]]; then
-        chmod a+x "$HOME" # Ensure acme.sh install dir is accessible
+        chmod a+x "$HOME"
 
         if [[ -f "$cert_path" && -f "$key_path" ]] && [[ -s "$cert_path" && -s "$key_path" ]] && [[ -f "$ca_log_path" ]]; then
             domain=$(cat "$ca_log_path")
             green "检测到原有域名 '$domain' 的ACME证书 ($cert_path, $key_path)，将直接应用。"
             hy_domain="$domain"
             USE_INSECURE_CLIENT_CONFIG="false"
-            apply_cert_permissions "$key_path" "$cert_path" # Apply user-requested permissions
+            apply_cert_permissions "$key_path" "$cert_path"
             if [[ -z "$ip" ]]; then red "错误: 服务器IP未设置。"; exit 1; fi
             yellow "将使用服务器IP: $ip, SNI: $hy_domain 生成客户端配置 (insecure: $USE_INSECURE_CLIENT_CONFIG)。"
         else
@@ -187,7 +188,6 @@ inst_cert(){
                 red "错误：域名DNS记录与服务器IP不匹配或无法解析。"; yellow "详情: SrvIP4:${temp_server_ipv4:-无} SrvIP6:${temp_server_ipv6:-无} DomA:${domain_a_record_ip:-无} DomAAAA:${domain_aaaa_record_ip:-无}"; exit 1
             fi
 
-            # Ensure cron/cronie and other dependencies are installed
             local acme_deps=("curl" "wget" "sudo" "socat" "openssl")
              if [[ "$SYSTEM" == "CentOS" || "$SYSTEM" == "Fedora" || "$SYSTEM" == "Rocky" || "$SYSTEM" == "Alma" ]]; then
                  acme_deps+=("cronie")
@@ -195,9 +195,8 @@ inst_cert(){
                  acme_deps+=("cron")
             fi
             for dep_pkg in "${acme_deps[@]}"; do
-                 ${PACKAGE_INSTALL[int]} "$dep_pkg"
+                 ${PACKAGE_INSTALL[int]} "$dep_pkg" # ensure_tool would be better but this is simpler here
             done
-            # Start and enable cron service
             local cron_daemon_to_manage="cron"
             if [[ "$SYSTEM" == "CentOS" || "$SYSTEM" == "Fedora" || "$SYSTEM" == "Rocky" || "$SYSTEM" == "Alma" ]]; then
                 cron_daemon_to_manage="crond"
@@ -228,7 +227,6 @@ inst_cert(){
                 if [[ -f "$cert_path" && -f "$key_path" ]] && [[ -s "$cert_path" && -s "$key_path" ]]; then
                     echo "$domain" > "$ca_log_path"
 
-                    # CRON JOB SETUP (Robust version)
                     green "正在尝试设置acme.sh证书自动续签的cron任务..."
                     local cron_service_active=false
                     local cron_daemon_name="cron"
@@ -291,7 +289,6 @@ inst_cert(){
                          yellow "请尝试手动添加以下行到root用户的crontab或/etc/crontab:"
                          yellow "0 0 * * * \"$ACME_SH_PATH\" --cron -f >/dev/null 2>&1"
                     fi
-                    # END CRON JOB SETUP
 
                     apply_cert_permissions "$key_path" "$cert_path"
 
@@ -311,7 +308,6 @@ inst_cert(){
         if ! verified_source_key_path=$(realpath -e "$key_path_input" 2>/dev/null); then red "密钥路径 '$key_path_input' 无效或文件不存在。"; exit 1; fi
 
         green "正在复制自定义证书到 $target_cert_dir ..."
-        # Global cert_path & key_path are already set to $target_cert_dir/...
         if cp "$verified_source_cert_path" "$cert_path" && cp "$verified_source_key_path" "$key_path"; then
             green "自定义证书已复制到 $cert_path 和 $key_path"
             apply_cert_permissions "$key_path" "$cert_path"
@@ -329,7 +325,6 @@ inst_cert(){
         if [[ -z "$ip" ]]; then red "错误: 服务器IP未设置。"; exit 1; fi
     else
         green "将使用必应自签证书 (客户端 insecure 必须为 true)"
-        # Global cert_path/key_path are already set to $target_cert_dir/...
         openssl ecparam -genkey -name prime256v1 -out "$key_path"
         openssl req -new -x509 -days 36500 -key "$key_path" -out "$cert_path" -subj "/CN=www.bing.com"
 
@@ -367,7 +362,6 @@ inst_jump(){
     echo ""
     read -rp "请输入选项 [1-2]: " jumpInput
 
-    # Clear previous jump rules by this script
     while IFS= read -r rule_line_args; do
       [[ -n "$rule_line_args" ]] && iptables -t nat -D $rule_line_args
     done < <(iptables-save -t nat | grep -oP "PREROUTING .* --comment \"$PORT_JUMP_COMMENT\"" || true)
@@ -419,29 +413,32 @@ insthysteria(){
     [[ -z "$ip" ]] && red "错误：无法获取服务器的公网IP地址！ Hysteria安装中止。" && exit 1
     yellow "脚本初步检测到服务器IP为: $ip (后续证书申请流程可能会根据DNS验证更新此IP)"
 
-    local packages_to_install=("curl" "wget" "sudo" "qrencode" "procps" "iptables-persistent" "netfilter-persistent" "coreutils" "openssl")
+    local packages_to_install_hysteria=("sudo" "procps" "iptables-persistent")
+
     if [[ "$SYSTEM" == "CentOS" || "$SYSTEM" == "Fedora" || "$SYSTEM" == "Rocky" || "$SYSTEM" == "Alma" ]]; then
-        packages_to_install+=("bind-utils" "cronie")
+        packages_to_install_hysteria+=("cronie")
     else
-        packages_to_install+=("dnsutils" "cron")
+        packages_to_install_hysteria+=("cron")
     fi
 
-    if [[ ! "$SYSTEM" == "CentOS" && ! "$SYSTEM" == "Fedora" && ! "$SYSTEM" == "Rocky" && ! "$SYSTEM" == "Alma" ]]; then ${PACKAGE_UPDATE[int]}; fi
-    for pkg_name_full in "${packages_to_install[@]}"; do
-        local pkg_to_check="$pkg_name_full"; local package_name_for_os="$pkg_name_full"
+    if [[ ! "$SYSTEM" == "CentOS" && ! "$SYSTEM" == "Fedora" && ! "$SYSTEM" == "Rocky" && ! "$SYSTEM" == "Alma" ]]; then 
+      # Run update once for apt systems if any package will be installed by ensure_tool below or specific acme_deps
+      # This is a heuristic, as ensure_tool for fundamental tools might have already run it.
+      # ${PACKAGE_UPDATE[int]}
+      : # Assuming ensure_tool calls at global scope handled initial update if needed
+    fi
+    for pkg_name_full in "${packages_to_install_hysteria[@]}"; do
+        local pkg_to_check="$pkg_name_full"
+        local package_name_for_os="$pkg_name_full"
         case "$pkg_name_full" in
-             "bind-utils") [[ "$SYSTEM" == "CentOS" || "$SYSTEM" == "Fedora" || "$SYSTEM" == "Rocky" || "$SYSTEM" == "Alma" ]] && pkg_to_check="dig" || continue ;;
-             "dnsutils") [[ ! "$SYSTEM" == "CentOS" && ! "$SYSTEM" == "Fedora" && ! "$SYSTEM" == "Rocky" && ! "$SYSTEM" == "Alma" ]] && pkg_to_check="dig" || continue ;;
-             "coreutils") pkg_to_check="realpath" ;;
-             "cronie") [[ "$SYSTEM" == "CentOS" || "$SYSTEM" == "Fedora" || "$SYSTEM" == "Rocky" || "$SYSTEM" == "Alma" ]] && pkg_to_check="crontab" || continue ;;
-             "cron") [[ ! "$SYSTEM" == "CentOS" && ! "$SYSTEM" == "Fedora" && ! "$SYSTEM" == "Rocky" && ! "$SYSTEM" == "Alma" ]] && pkg_to_check="crontab" || continue ;;
-             "iptables-persistent") package_name_for_os="iptables-persistent" ;; # Handle package name if different
-             "netfilter-persistent") package_name_for_os="iptables-persistent" ;; # Often same package
-             *) ;; # Default case
+             "procps") pkg_to_check="ss" ;; # Check for 'ss' command for 'procps' package
+             "cronie") pkg_to_check="crontab" ;;
+             "cron") pkg_to_check="crontab" ;;
+             "iptables-persistent") package_name_for_os="iptables-persistent" ;;
+             *) ;;
         esac
         ensure_tool "$pkg_to_check" "$package_name_for_os"
     done
-
 
     if [[ ! -f "/usr/local/bin/hysteria" ]]; then
         wget -N https://raw.githubusercontent.com/Misaka-blog/hysteria-install/main/hy2/install_server.sh
@@ -462,7 +459,6 @@ insthysteria(){
     [[ -z "$hy_domain" ]] && red "内部错误: SNI ($hy_domain) 未设置。" && exit 1
     [[ ! -f "$cert_path" || ! -f "$key_path" ]] && red "内部错误: 证书或密钥在 $cert_path / $key_path 未找到。" && exit 1
 
-    # $cert_path and $key_path are now always /etc/hysteria/... from inst_cert
     cat << EOF > /etc/hysteria/config.yaml
 listen: :$port
 tls:
@@ -663,16 +659,15 @@ change_cert(){
     if [[ ! -f /etc/hysteria/config.yaml ]]; then red "Hysteria 未安装。" && return; fi
     get_systemd_service_name; if [[ -z "$SYSTEMD_SERVICE_NAME" ]]; then red "Hysteria服务名未知!" && return; fi
 
-    # Config always points to /etc/hysteria/... now, but read it for consistency check maybe?
     local old_cert_path_from_config=$(grep -oP 'cert: \K\S+' /etc/hysteria/config.yaml)
     local old_key_path_from_config=$(grep -oP 'key: \K\S+' /etc/hysteria/config.yaml)
     local old_hy_domain_client="N/A"; [[ -f /root/hy/hy-client.yaml ]] && old_hy_domain_client=$(grep -oP 'sni: \K\S+' /root/hy/hy-client.yaml || echo "N/A")
 
     local preserved_ip_before_cert_change="$ip"
 
-    inst_cert # Updates globals: USE_INSECURE_CLIENT_CONFIG, cert_path, key_path, hy_domain, maybe ip. Sets perms.
+    inst_cert # This updates global vars and sets permissions. $cert_path, $key_path point to /etc/hysteria/...
 
-    # Ensure config points to the standard paths (should already be if inst_cert worked)
+    # Ensure Hysteria config points to /etc/hysteria/...
     local std_cert_path="/etc/hysteria/cert.crt"; local std_key_path="/etc/hysteria/private.key"
     local esc_std_cert_path=$(printf '%s\n' "$std_cert_path" | sed 's:[][\/.^$*]:\\&:g')
     local esc_std_key_path=$(printf '%s\n' "$std_key_path" | sed 's:[][\/.^$*]:\\&:g')
@@ -695,7 +690,7 @@ change_cert(){
         local esc_new_client_ip_f=$(printf '%s\n' "$new_client_ip_f" | sed 's:[][\/.^$*]:\\&:g')
         if [[ -f /root/hy/hy-client.yaml ]]; then sed -i "s|server: $esc_old_client_ip_f:|server: $esc_new_client_ip_f:|g" /root/hy/hy-client.yaml; fi
         if [[ -f /root/hy/hy-client.json ]]; then sed -i "s|\"server\": \"$esc_old_client_ip_f:|\"server\": \"$esc_new_client_ip_f:|g" /root/hy/hy-client.json; fi
-        local escaped_old_ip_url_at="@$(printf '%s\n' "$old_client_ip_f" | sed 's:[][\/.^$*]:\\&:g')" # Simplified for clarity
+        local escaped_old_ip_url_at="@$(printf '%s\n' "$old_client_ip_f" | sed 's:[][\/.^$*]:\\&:g')" # Simpler, assuming @IP: is unique
         local escaped_new_ip_url_at="@$(printf '%s\n' "$new_client_ip_f" | sed 's:[][\/.^$*]:\\&:g')"
         if [[ -f /root/hy/url.txt ]]; then sed -i "s|$escaped_old_ip_url_at|$escaped_new_ip_url_at|g" /root/hy/url.txt; fi
     fi
@@ -732,7 +727,6 @@ changeport(){
     local client_ip_f="$ip"; if [[ "$ip" == *":"* ]]; then client_ip_f="[$ip]"; fi
     local esc_client_ip_f=$(printf '%s\n' "$client_ip_f" | sed 's:[][\/.^$*]:\\&:g')
 
-    # Update main port number in client config files and URL
     if [[ -f /root/hy/hy-client.yaml ]]; then sed -i "s/\(server: $esc_client_ip_f\):$old_server_port/\1:$new_port/" /root/hy/hy-client.yaml; fi
     if [[ -f /root/hy/hy-client.json ]]; then sed -i "s/\(\"server\": \"$esc_client_ip_f\):$old_server_port/\1:$new_port/" /root/hy/hy-client.json; fi
     if [[ -f /root/hy/url.txt ]]; then
@@ -781,7 +775,7 @@ changeproxysite(){
     local oldproxysite=$(grep -oP 'url: https://\K\S+' /etc/hysteria/config.yaml)
     [[ -z "$oldproxysite" ]] && red "无法读取旧伪装网站。" && return 1
 
-    inst_site # Sets global $proxysite
+    inst_site
 
     local esc_old=$(printf '%s\n' "$oldproxysite" | sed 's:[][\/.^$*]:\\&:g')
     local esc_new=$(printf '%s\n' "$proxysite" | sed 's:[][\/.^$*]:\\&:g')
@@ -823,7 +817,7 @@ showconf(){
     fi
     if [[ -f /root/hy/url.txt ]]; then
         echo ""; yellow "分享链接 (/root/hy/url.txt):"; local current_url=$(cat /root/hy/url.txt); echo "$current_url"
-        echo ""; yellow "二维码分享链接:"; qrencode -t ANSIUTF8 "$current_url"
+        # QR Code removed
     fi
 }
 
