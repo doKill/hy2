@@ -7,6 +7,22 @@ GREEN="\033[32m"
 YELLOW="\033[33m"
 PLAIN="\033[0m"
 
+# --- Global variable declarations ---
+ip=""
+cert_path="/etc/hysteria/cert.crt" # Fixed path
+key_path="/etc/hysteria/private.key"   # Fixed path
+hy_domain=""
+domain=""
+port=""
+firstport=""
+endport=""
+auth_pwd=""
+proxysite=""
+SYSTEMD_SERVICE_NAME=""
+USE_INSECURE_CLIENT_CONFIG="false" # ACME certs mean client can use secure
+PORT_JUMP_COMMENT="hysteria_jump_rule_v2"
+PACKAGE_UPDATE_RUN_ONCE_FLAG="" # Flag to ensure apt update runs only once if needed
+
 red(){
     echo -e "\033[31m\033[01m$1\033[0m"
 }
@@ -19,69 +35,36 @@ yellow(){
     echo -e "\033[33m\033[01m$1\033[0m"
 }
 
-# 判断系统及定义系统安装依赖方式
-REGEX=("debian" "ubuntu" "centos|red hat|kernel|oracle linux|alma|rocky" "'amazon linux'" "fedora")
-RELEASE=("Debian" "Ubuntu" "CentOS" "CentOS" "Fedora")
-PACKAGE_UPDATE=("apt-get update" "apt-get update" "yum -y update" "yum -y update" "yum -y update")
-PACKAGE_INSTALL=("apt -y install" "apt -y install" "yum -y install" "yum -y install" "yum -y install")
-PACKAGE_REMOVE=("apt -y remove" "apt -y remove" "yum -y remove" "yum -y remove" "yum -y remove")
-PACKAGE_UNINSTALL=("apt -y autoremove" "apt -y autoremove" "yum -y autoremove" "yum -y autoremove" "yum -y autoremove")
-
-# --- Global variable declarations ---
-ip=""
-cert_path=""
-key_path=""
-hy_domain=""
-domain=""
-port=""
-firstport=""
-endport=""
-auth_pwd=""
-proxysite=""
-SYSTEMD_SERVICE_NAME=""
-USE_INSECURE_CLIENT_CONFIG="true"
-PORT_JUMP_COMMENT="hysteria_jump_rule_v2"
-PACKAGE_UPDATE_RUN_ONCE_FLAG="" # Flag to ensure apt update runs only once if needed
-
 [[ $EUID -ne 0 ]] && red "注意: 请在root用户下运行脚本" && exit 1
 
-CMD=("$(grep -i pretty_name /etc/os-release 2>/dev/null | cut -d \" -f2)" "$(hostnamectl 2>/dev/null | grep -i system | cut -d : -f2)" "$(lsb_release -sd 2>/dev/null)" "$(grep -i description /etc/lsb-release 2>/dev/null | cut -d \" -f2)" "$(grep . /etc/redhat-release 2>/dev/null)" "$(grep . /etc/issue 2>/dev/null | cut -d \\ -f1 | sed '/^[ ]*$/d')")
-
-for i in "${CMD[@]}"; do
-    SYS="$i" && [[ -n $SYS ]] && break
-done
-
-for ((int = 0; int < ${#REGEX[@]}; int++)); do
-    [[ $(echo "$SYS" | tr '[:upper:]' '[:lower:]') =~ ${REGEX[int]} ]] && SYSTEM="${RELEASE[int]}" && [[ -n $SYSTEM ]] && break
-done
-
-[[ -z $SYSTEM ]] && red "目前暂不支持你的VPS的操作系统！" && exit 1
+# Check for Debian 12 explicitly
+if ! grep -q -E "Debian GNU/Linux 12|VERSION_ID=\"12\"" /etc/os-release; then
+    red "错误: 此脚本设计为在 Debian 12 上运行。"
+    yellow "您的系统似乎不是 Debian 12。继续运行可能会导致未知问题。"
+    read -rp "您确定要继续吗? (y/N): " confirm_continue
+    if [[ ! "$confirm_continue" =~ ^[Yy]$ ]]; then
+        exit 1
+    fi
+fi
 
 ensure_tool() {
-    local tool_cmd_to_check="$1" # This is the command we expect to find in PATH
-    local package_to_install="$2"  # This is the package that provides the command
+    local tool_cmd_to_check="$1"
+    local package_to_install="$2"
 
     if type -P "$tool_cmd_to_check" >/dev/null 2>&1; then
-        # green "$tool_cmd_to_check 已安装。" # Optional: for debugging
-        return 0 # Tool already found
+        return 0
     fi
-
-    # Specific check for netfilter-persistent if type -P fails (common on Debian/Ubuntu)
     if [[ "$tool_cmd_to_check" == "netfilter-persistent" && -x "/usr/sbin/netfilter-persistent" ]]; then
-        # green "$tool_cmd_to_check (在 /usr/sbin/netfilter-persistent 找到) 已存在。"
         return 0
     fi
 
     yellow "$tool_cmd_to_check 未找到，正在尝试安装包 $package_to_install..."
-    if [[ ! "$SYSTEM" == "CentOS" && ! "$SYSTEM" == "Fedora" && ! "$SYSTEM" == "Rocky" && ! "$SYSTEM" == "Alma" ]]; then
-         if [[ -z "$PACKAGE_UPDATE_RUN_ONCE_FLAG" ]]; then
-            ${PACKAGE_UPDATE[int]}
-            export PACKAGE_UPDATE_RUN_ONCE_FLAG="true" # Set flag after first run
-         fi
+    if [[ -z "$PACKAGE_UPDATE_RUN_ONCE_FLAG" ]]; then
+        apt-get update -qq
+        export PACKAGE_UPDATE_RUN_ONCE_FLAG="true"
     fi
-    ${PACKAGE_INSTALL[int]} "$package_to_install"
+    apt -y -qq install "$package_to_install"
 
-    # Re-check after install attempt
     if type -P "$tool_cmd_to_check" >/dev/null 2>&1; then
         green "$tool_cmd_to_check (来自包 $package_to_install) 安装成功。"
     elif [[ "$tool_cmd_to_check" == "netfilter-persistent" && -x "/usr/sbin/netfilter-persistent" ]]; then
@@ -93,19 +76,11 @@ ensure_tool() {
 
 # Ensure essential tools are available early
 ensure_tool "curl" "curl"
-if [[ "$SYSTEM" == "CentOS" || "$SYSTEM" == "Fedora" || "$SYSTEM" == "Rocky" || "$SYSTEM" == "Alma" ]]; then
-    ensure_tool "dig" "bind-utils"
-else
-    ensure_tool "dig" "dnsutils"
-fi
+ensure_tool "dig" "dnsutils"
 ensure_tool "realpath" "coreutils"
 ensure_tool "openssl" "openssl"
-ensure_tool "iptables" "iptables" # This should bring iptables-save etc.
-# ensure_tool "qrencode" "qrencode" # Removed qrencode
-
-if [[ "$SYSTEM" == "Debian" || "$SYSTEM" == "Ubuntu" ]]; then
-    ensure_tool "netfilter-persistent" "iptables-persistent"
-fi
+ensure_tool "iptables" "iptables"
+ensure_tool "netfilter-persistent" "iptables-persistent"
 
 
 realip(){
@@ -116,240 +91,159 @@ realip(){
 }
 
 apply_cert_permissions() {
-    local key_file_path="$1"
-    local cert_file_path="$2"
+    local key_file_to_perm="$1"
+    local cert_file_to_perm="$2"
 
     red "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
-    red "警告：您要求为私钥 '$key_file_path' (以及证书) 设置 777 (rwxrwxrwx) 权限。"
+    red "警告：您要求为私钥 '$key_file_to_perm' (以及证书) 设置 777 (rwxrwxrwx) 权限。"
     red "这会带来严重的安全风险，因为它允许系统上任何用户读取、修改甚至删除您的私钥和证书。"
-    red "强烈建议您在脚本执行完毕后，为私钥 '$key_file_path' 设置更严格的权限 (例如：chmod 600 '$key_file_path')。"
-    red "证书 '$cert_file_path' 的权限建议为 644 (例如：chmod 644 '$cert_file_path')。"
+    red "强烈建议您在脚本执行完毕后，为私钥 '$key_file_to_perm' 设置更严格的权限 (例如：chmod 600 '$key_file_to_perm')。"
+    red "证书 '$cert_file_to_perm' 的权限建议为 644 (例如：chmod 644 '$cert_file_to_perm')。"
     red "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
     yellow "按任意键继续并应用 777 权限，或按 Ctrl+C 中止脚本..."
     read -n 1 -s
 
-    chmod 777 "$key_file_path"
-    chmod 777 "$cert_file_path"
-    green "权限已按要求设置为 777: '$key_file_path', '$cert_file_path'"
+    chmod 777 "$key_file_to_perm"
+    chmod 777 "$cert_file_to_perm"
+    green "权限已按要求设置为 777: '$key_file_to_perm', '$cert_file_to_perm'"
 }
 
-
 inst_cert(){
-    green "Hysteria 2 协议证书申请方式如下："
-    echo ""
-    echo -e " ${GREEN}1.${PLAIN} 必应自签证书 ${YELLOW}（默认）${PLAIN} -> ${RED}客户端 insecure 必须为 true${PLAIN}"
-    echo -e " ${GREEN}2.${PLAIN} Acme 脚本自动申请 -> ${GREEN}客户端 insecure 可以为 false${PLAIN}"
-    echo -e " ${GREEN}3.${PLAIN} 自定义证书路径 (将复制到 /etc/hysteria/) -> ${GREEN}客户端 insecure 可以为 false (证书需客户端信任)${PLAIN}"
-    echo ""
-    read -rp "请输入选项 [1-3]: " certInput
-
-    USE_INSECURE_CLIENT_CONFIG="true"
+    green "Hysteria 2 将通过 ACME.sh 脚本自动申请证书。"
+    USE_INSECURE_CLIENT_CONFIG="false" # ACME certs are trusted
 
     local target_cert_dir="/etc/hysteria"
-    cert_path="$target_cert_dir/cert.crt"
-    key_path="$target_cert_dir/private.key"
+    # Global cert_path and key_path are already set to these target paths
     local ca_log_path="$target_cert_dir/ca.log"
 
     mkdir -p "$target_cert_dir"
+    chmod a+x "$HOME" # For acme.sh install dir
 
-    if [[ $certInput == 2 ]]; then
-        chmod a+x "$HOME"
-
-        if [[ -f "$cert_path" && -f "$key_path" ]] && [[ -s "$cert_path" && -s "$key_path" ]] && [[ -f "$ca_log_path" ]]; then
-            domain=$(cat "$ca_log_path")
-            green "检测到原有域名 '$domain' 的ACME证书 ($cert_path, $key_path)，将直接应用。"
-            hy_domain="$domain"
-            USE_INSECURE_CLIENT_CONFIG="false"
-            apply_cert_permissions "$key_path" "$cert_path"
-            if [[ -z "$ip" ]]; then red "错误: 服务器IP未设置。"; exit 1; fi
-            yellow "将使用服务器IP: $ip, SNI: $hy_domain 生成客户端配置 (insecure: $USE_INSECURE_CLIENT_CONFIG)。"
-        else
-            green "准备为新域名申请ACME证书 (将保存到 $target_cert_dir)..."
-            WARPv4Status=$(curl -s4m8 https://www.cloudflare.com/cdn-cgi/trace -k | grep warp | cut -d= -f2)
-            WARPv6Status=$(curl -s6m8 https://www.cloudflare.com/cdn-cgi/trace -k | grep warp | cut -d= -f2)
-            local temp_server_ipv4=""
-            local temp_server_ipv6=""
-
-            yellow "正在检测服务器公网IP地址..."
-            if [[ $WARPv4Status =~ on|plus ]] || [[ $WARPv6Status =~ on|plus ]]; then
-                green "检测到WARP已激活，临时停用WARP以获取真实IP..."
-                wg-quick down wgcf >/dev/null 2>&1; systemctl stop warp-go >/dev/null 2>&1; sleep 3
-                temp_server_ipv4=$(curl -s4m8 ip.sb -k); temp_server_ipv6=$(curl -s6m8 ip.sb -k)
-                green "尝试重新激活WARP...";
-                if [[ $WARPv4Status =~ on|plus ]] || [[ $WARPv6Status =~ on|plus ]]; then
-                    wg-quick up wgcf >/dev/null 2>&1; systemctl start warp-go >/dev/null 2>&1
-                fi
-            else
-                temp_server_ipv4=$(curl -s4m8 ip.sb -k); temp_server_ipv6=$(curl -s6m8 ip.sb -k)
-            fi
-
-            if [[ -z "$temp_server_ipv4" && -z "$temp_server_ipv6" ]]; then red "错误：无法获取服务器公网IP！"; exit 1; fi
-            yellow "检测到服务器公网IPs: IPv4: ${temp_server_ipv4:-N/A}, IPv6: ${temp_server_ipv6:-N/A}"
-
-            read -p "请输入需要申请证书的域名：" domain_input_for_acme
-            [[ -z "$domain_input_for_acme" ]] && red "未输入域名！" && exit 1
-            domain="$domain_input_for_acme"; green "已输入的域名：$domain" && sleep 1
-
-            yellow "正在解析域名 '$domain' 的DNS记录..."
-            local domain_a_record_ip=$(dig A +short "$domain" | head -n1)
-            local domain_aaaa_record_ip=$(dig AAAA +short "$domain" | head -n1)
-            local is_ipv6_validation_for_acme=false
-
-            if [[ -n "$temp_server_ipv4" && -n "$domain_a_record_ip" && "$domain_a_record_ip" == "$temp_server_ipv4" ]]; then
-                ip="$temp_server_ipv4"; is_ipv6_validation_for_acme=false
-                green "验证成功: 域名 '$domain' A记录 ($domain_a_record_ip) -> 服务器 IPv4 ($ip)."
-            elif [[ -n "$temp_server_ipv6" && -n "$domain_aaaa_record_ip" && "$domain_aaaa_record_ip" == "$temp_server_ipv6" ]]; then
-                ip="$temp_server_ipv6"; is_ipv6_validation_for_acme=true
-                green "验证成功: 域名 '$domain' AAAA记录 ($domain_aaaa_record_ip) -> 服务器 IPv6 ($ip)."
-            else
-                red "错误：域名DNS记录与服务器IP不匹配或无法解析。"; yellow "详情: SrvIP4:${temp_server_ipv4:-无} SrvIP6:${temp_server_ipv6:-无} DomA:${domain_a_record_ip:-无} DomAAAA:${domain_aaaa_record_ip:-无}"; exit 1
-            fi
-
-            local acme_deps=("curl" "wget" "sudo" "socat" "openssl")
-             if [[ "$SYSTEM" == "CentOS" || "$SYSTEM" == "Fedora" || "$SYSTEM" == "Rocky" || "$SYSTEM" == "Alma" ]]; then
-                 acme_deps+=("cronie")
-            else
-                 acme_deps+=("cron")
-            fi
-            for dep_pkg in "${acme_deps[@]}"; do
-                 # ensure_tool could be used here too, but direct install is fine as these are specific to ACME path
-                 ${PACKAGE_INSTALL[int]} "$dep_pkg"
-            done
-            local cron_daemon_to_manage="cron"
-            if [[ "$SYSTEM" == "CentOS" || "$SYSTEM" == "Fedora" || "$SYSTEM" == "Rocky" || "$SYSTEM" == "Alma" ]]; then
-                cron_daemon_to_manage="crond"
-            fi
-            systemctl start "$cron_daemon_to_manage" 2>/dev/null ; systemctl enable "$cron_daemon_to_manage" 2>/dev/null
-
-            local ACME_SH_PATH="$HOME/.acme.sh/acme.sh"
-            if [[ ! -f "$ACME_SH_PATH" ]]; then
-                yellow "$ACME_SH_PATH 未找到。安装acme.sh..."; mkdir -p "$HOME/.acme.sh"
-                if curl https://get.acme.sh | sh -s email=$(date +%s%N | md5sum | cut -c 1-16)@gmail.com; then green "acme.sh 安装成功。"; else red "acme.sh 安装失败。"; exit 1; fi
-                if [[ -f "$HOME/.bashrc" ]]; then source "$HOME/.bashrc"; fi
-            fi
-            if [[ ! -f "$ACME_SH_PATH" ]]; then red "$ACME_SH_PATH 文件不存在。"; exit 1; fi
-            if [[ ! -x "$ACME_SH_PATH" ]]; then yellow "$ACME_SH_PATH 不可执行。尝试chmod +x..."; chmod +x "$ACME_SH_PATH"; if [[ ! -x "$ACME_SH_PATH" ]]; then red "未能使 $ACME_SH_PATH 可执行。"; exit 1; fi; fi
-
-            "$ACME_SH_PATH" --upgrade --auto-upgrade
-            "$ACME_SH_PATH" --set-default-ca --server letsencrypt
-
-            green "为 '$domain' 申请证书 (使用 ${ip})..."
-            local issue_cmd_status
-            if $is_ipv6_validation_for_acme; then "$ACME_SH_PATH" --issue -d "${domain}" --standalone -k ec-256 --insecure --listen-v6; issue_cmd_status=$?;
-            else "$ACME_SH_PATH" --issue -d "${domain}" --standalone -k ec-256 --insecure; issue_cmd_status=$?; fi
-            if [[ $issue_cmd_status -ne 0 ]]; then red "acme.sh --issue 失败，码: $issue_cmd_status。"; exit 1; fi
-            green "证书签发命令为 '$domain' 执行完毕。"
-
-            green "安装 '$domain' 的证书到 $target_cert_dir ..."
-            if "$ACME_SH_PATH" --install-cert -d "${domain}" --key-file "$key_path" --fullchain-file "$cert_path" --ecc; then
-                if [[ -f "$cert_path" && -f "$key_path" ]] && [[ -s "$cert_path" && -s "$key_path" ]]; then
-                    echo "$domain" > "$ca_log_path"
-
-                    green "正在尝试设置acme.sh证书自动续签的cron任务..."
-                    local cron_service_active=false
-                    # cron_daemon_name already set above based on SYSTEM
-                    if systemctl is-active --quiet "$cron_daemon_to_manage"; then # Use a consistent variable
-                        green "Cron服务 ($cron_daemon_to_manage) 正在运行。"
-                        cron_service_active=true
-                    else
-                        yellow "警告: Cron服务 ($cron_daemon_to_manage) 当前未运行。正在尝试启动..."
-                        systemctl start "$cron_daemon_to_manage"
-                        sleep 2
-                        if systemctl is-active --quiet "$cron_daemon_to_manage"; then
-                            green "Cron服务 ($cron_daemon_to_manage) 已成功启动。"
-                            cron_service_active=true
-                        else
-                            red "错误: 无法启动Cron服务 ($cron_daemon_to_manage)。自动续签将无法工作。"
-                        fi
-                    fi
-
-                    local cron_job_set_successfully=false
-                    if $cron_service_active; then
-                        local current_crontab_content
-                        current_crontab_content=$(crontab -l 2>/dev/null)
-                        local acme_cron_cmd
-                        acme_cron_cmd=$(printf "0 0 * * * %s --cron -f >/dev/null 2>&1" "\"$ACME_SH_PATH\"")
-
-                        local new_crontab_content
-                        new_crontab_content=$(echo -e "${current_crontab_content}" | grep -vF "\"$ACME_SH_PATH\" --cron")
-                        new_crontab_content=$(echo -e "${new_crontab_content}\n${acme_cron_cmd}" | sed '/^$/d')
-
-                        if echo "${new_crontab_content}" | crontab -; then
-                            green "用户crontab更新成功 (尝试)。"
-                        else
-                            yellow "警告: 更新用户crontab失败。将尝试 /etc/crontab (如果适用)。"
-                        fi
-
-                        if [[ -w /etc/crontab && ("$SYSTEM" == "CentOS" || "$SYSTEM" == "Fedora" || "$SYSTEM" == "Rocky" || "$SYSTEM" == "Alma") ]]; then
-                            green "正在检查/更新 /etc/crontab (适用于 $SYSTEM)..."
-                            local cron_pattern_in_etc_crontab
-                            cron_pattern_in_etc_crontab=$(printf '%s\n' "\"$ACME_SH_PATH\" --cron" | sed 's/[\/\.*^$[]/\\&/g')
-
-                            sudo sed -i "/${cron_pattern_in_etc_crontab}/d" /etc/crontab
-                            echo "0 0 * * * root \"$ACME_SH_PATH\" --cron -f >/dev/null 2>&1" | sudo tee -a /etc/crontab >/dev/null
-                            green "/etc/crontab 已尝试更新。"
-                        fi
-
-                        sleep 1
-
-                        if crontab -l 2>/dev/null | grep -qF "\"$ACME_SH_PATH\" --cron" || grep -qF "\"$ACME_SH_PATH\" --cron" /etc/crontab 2>/dev/null ; then
-                             green "acme.sh 证书自动续签的cron任务已成功设置/验证。"
-                             cron_job_set_successfully=true
-                        fi
-                    fi
-
-                    if ! $cron_job_set_successfully; then
-                         yellow "警告: 未能自动设置acme.sh的cron续签任务。您可能需要手动设置。"
-                         yellow "请尝试手动添加以下行到root用户的crontab或/etc/crontab:"
-                         yellow "0 0 * * * \"$ACME_SH_PATH\" --cron -f >/dev/null 2>&1"
-                    fi
-
-                    apply_cert_permissions "$key_path" "$cert_path"
-
-                    green "证书申请与安装成功!"; yellow "证书: $cert_path, 私钥: $key_path"
-                    hy_domain="$domain"
-                    USE_INSECURE_CLIENT_CONFIG="false"
-                else red "证书文件 ($cert_path, $key_path) 未生成或为空。"; exit 1; fi
-            else red "acme.sh --install-cert 失败。"; exit 1; fi
-        fi
-    elif [[ $certInput == 3 ]]; then
-        read -p "请输入您现有公钥文件crt的【绝对路径】：" cert_path_input
-        local verified_source_cert_path
-        if ! verified_source_cert_path=$(realpath -e "$cert_path_input" 2>/dev/null); then red "公钥路径 '$cert_path_input' 无效或文件不存在。"; exit 1; fi
-
-        read -p "请输入您现有密钥文件key的【绝对路径】：" key_path_input
-        local verified_source_key_path
-        if ! verified_source_key_path=$(realpath -e "$key_path_input" 2>/dev/null); then red "密钥路径 '$key_path_input' 无效或文件不存在。"; exit 1; fi
-
-        green "正在复制自定义证书到 $target_cert_dir ..."
-        if cp "$verified_source_cert_path" "$cert_path" && cp "$verified_source_key_path" "$key_path"; then
-            green "自定义证书已复制到 $cert_path 和 $key_path"
-            apply_cert_permissions "$key_path" "$cert_path"
-        else
-            red "错误：复制自定义证书失败。"
-            exit 1
-        fi
-
-        read -p "请输入证书对应的域名 (SNI)：" domain_input_custom
-        [[ -z "$domain_input_custom" ]] && red "SNI域名不能为空!" && exit 1
-        domain="$domain_input_custom"; hy_domain="$domain_input_custom"
-        yellow "证书SNI将使用：$hy_domain"
-        yellow "警告: 使用自定义证书时，为确保客户端 'insecure: false' 能正常工作，此证书必须由客户端信任的CA签发。"
-        USE_INSECURE_CLIENT_CONFIG="false"
-        if [[ -z "$ip" ]]; then red "错误: 服务器IP未设置。"; exit 1; fi
-    else
-        green "将使用必应自签证书 (客户端 insecure 必须为 true)"
-        openssl ecparam -genkey -name prime256v1 -out "$key_path"
-        openssl req -new -x509 -days 36500 -key "$key_path" -out "$cert_path" -subj "/CN=www.bing.com"
-
-        apply_cert_permissions "$key_path" "$cert_path"
-
-        domain="www.bing.com"; hy_domain="www.bing.com"
-        yellow "自签证书SNI将使用：$hy_domain"
-        yellow "注意: 使用自签名证书，客户端必须配置为 'insecure: true' 才能连接。"
-        USE_INSECURE_CLIENT_CONFIG="true"
-        if [[ -z "$ip" ]]; then red "错误: 服务器IP未设置。"; exit 1; fi
+    local previous_domain_from_log=""
+    if [[ -f "$ca_log_path" ]]; then
+        previous_domain_from_log=$(cat "$ca_log_path")
     fi
+
+    if [[ -f "$cert_path" && -f "$key_path" ]] && [[ -s "$cert_path" && -s "$key_path" ]] && [[ -n "$previous_domain_from_log" ]]; then
+        read -rp "检测到域名 '$previous_domain_from_log' 的现有证书。是否继续使用并尝试续期此域名？(Y/n)，或输入新域名: " domain_choice
+        if [[ -z "$domain_choice" || "$domain_choice" =~ ^[Yy]$ ]]; then
+            domain="$previous_domain_from_log"
+            green "将为域名 '$domain' 尝试续期/验证证书。"
+        elif [[ "$domain_choice" =~ ^[Nn]$ ]]; then
+            read -p "请输入需要申请证书的新域名：" domain_input_for_acme
+            domain="$domain_input_for_acme"
+        else # User entered a new domain directly
+            domain="$domain_choice"
+        fi
+    else
+        read -p "请输入需要申请证书的域名：" domain_input_for_acme
+        domain="$domain_input_for_acme"
+    fi
+
+    [[ -z "$domain" ]] && red "未输入域名！证书申请中止。" && return 1 # Return instead of exit for change_cert
+    green "准备为域名 '$domain' 申请ACME证书 (将保存到 $target_cert_dir)..."
+    hy_domain="$domain" # SNI will be the domain we get cert for
+
+    WARPv4Status=$(curl -s4m8 https://www.cloudflare.com/cdn-cgi/trace -k | grep warp | cut -d= -f2)
+    WARPv6Status=$(curl -s6m8 https://www.cloudflare.com/cdn-cgi/trace -k | grep warp | cut -d= -f2)
+    local temp_server_ipv4=""
+    local temp_server_ipv6=""
+
+    yellow "正在检测服务器公网IP地址..."
+    if [[ $WARPv4Status =~ on|plus ]] || [[ $WARPv6Status =~ on|plus ]]; then
+        green "检测到WARP已激活，临时停用WARP以获取真实IP..."
+        wg-quick down wgcf >/dev/null 2>&1; systemctl stop warp-go >/dev/null 2>&1; sleep 3
+        temp_server_ipv4=$(curl -s4m8 ip.sb -k); temp_server_ipv6=$(curl -s6m8 ip.sb -k)
+        green "尝试重新激活WARP...";
+        if [[ $WARPv4Status =~ on|plus ]] || [[ $WARPv6Status =~ on|plus ]]; then
+            wg-quick up wgcf >/dev/null 2>&1; systemctl start warp-go >/dev/null 2>&1
+        fi
+    else
+        temp_server_ipv4=$(curl -s4m8 ip.sb -k); temp_server_ipv6=$(curl -s6m8 ip.sb -k)
+    fi
+
+    if [[ -z "$temp_server_ipv4" && -z "$temp_server_ipv6" ]]; then red "错误：无法获取服务器公网IP！"; return 1; fi
+    yellow "检测到服务器公网IPs: IPv4: ${temp_server_ipv4:-N/A}, IPv6: ${temp_server_ipv6:-N/A}"
+
+    yellow "正在解析域名 '$domain' 的DNS记录..."
+    local domain_a_record_ip=$(dig A +short "$domain" | head -n1)
+    local domain_aaaa_record_ip=$(dig AAAA +short "$domain" | head -n1)
+    local is_ipv6_validation_for_acme=false
+
+    # Global $ip is updated here based on validation
+    if [[ -n "$temp_server_ipv4" && -n "$domain_a_record_ip" && "$domain_a_record_ip" == "$temp_server_ipv4" ]]; then
+        ip="$temp_server_ipv4"; is_ipv6_validation_for_acme=false
+        green "验证成功: 域名 '$domain' A记录 ($domain_a_record_ip) -> 服务器 IPv4 ($ip)."
+    elif [[ -n "$temp_server_ipv6" && -n "$domain_aaaa_record_ip" && "$domain_aaaa_record_ip" == "$temp_server_ipv6" ]]; then
+        ip="$temp_server_ipv6"; is_ipv6_validation_for_acme=true
+        green "验证成功: 域名 '$domain' AAAA记录 ($domain_aaaa_record_ip) -> 服务器 IPv6 ($ip)."
+    else
+        red "错误：域名DNS记录与服务器IP不匹配或无法解析。"; yellow "详情: SrvIP4:${temp_server_ipv4:-无} SrvIP6:${temp_server_ipv6:-无} DomA:${domain_a_record_ip:-无} DomAAAA:${domain_aaaa_record_ip:-无}"; return 1
+    fi
+
+    apt -y -qq install curl wget sudo socat openssl dnsutils cron
+    systemctl start cron 2>/dev/null ; systemctl enable cron 2>/dev/null
+
+    local ACME_SH_PATH="$HOME/.acme.sh/acme.sh"
+    if [[ ! -f "$ACME_SH_PATH" ]]; then
+        yellow "$ACME_SH_PATH 未找到。安装acme.sh..."; mkdir -p "$HOME/.acme.sh"
+        if curl https://get.acme.sh | sh -s email=$(date +%s%N | md5sum | cut -c 1-16)@gmail.com; then green "acme.sh 安装成功。"; else red "acme.sh 安装失败。"; return 1; fi
+        if [[ -f "$HOME/.bashrc" ]]; then source "$HOME/.bashrc"; fi
+    fi
+    if [[ ! -f "$ACME_SH_PATH" ]]; then red "$ACME_SH_PATH 文件不存在。"; return 1; fi
+    if [[ ! -x "$ACME_SH_PATH" ]]; then yellow "$ACME_SH_PATH 不可执行。尝试chmod +x..."; chmod +x "$ACME_SH_PATH"; if [[ ! -x "$ACME_SH_PATH" ]]; then red "未能使 $ACME_SH_PATH 可执行。"; return 1; fi; fi
+
+    "$ACME_SH_PATH" --upgrade --auto-upgrade
+    "$ACME_SH_PATH" --set-default-ca --server letsencrypt
+
+    green "为 '$domain' 申请证书 (使用 ${ip})..."
+    local issue_cmd_status
+    if $is_ipv6_validation_for_acme; then "$ACME_SH_PATH" --issue -d "${domain}" --standalone -k ec-256 --insecure --listen-v6; issue_cmd_status=$?;
+    else "$ACME_SH_PATH" --issue -d "${domain}" --standalone -k ec-256 --insecure; issue_cmd_status=$?; fi
+    if [[ $issue_cmd_status -ne 0 ]]; then red "acme.sh --issue 失败，码: $issue_cmd_status。"; return 1; fi
+    green "证书签发命令为 '$domain' 执行完毕。"
+
+    green "安装 '$domain' 的证书到 $target_cert_dir ..."
+    if "$ACME_SH_PATH" --install-cert -d "${domain}" --key-file "$key_path" --fullchain-file "$cert_path" --ecc; then
+        if [[ -f "$cert_path" && -f "$key_path" ]] && [[ -s "$cert_path" && -s "$key_path" ]]; then
+            echo "$domain" > "$ca_log_path"
+
+            green "正在尝试设置acme.sh证书自动续签的cron任务..."
+            local cron_service_active=false
+            local cron_daemon_name="cron" # Debian uses "cron"
+
+            if systemctl is-active --quiet "$cron_daemon_name"; then
+                green "Cron服务 ($cron_daemon_name) 正在运行。"
+                cron_service_active=true
+            else
+                yellow "警告: Cron服务 ($cron_daemon_name) 当前未运行。正在尝试启动..."
+                systemctl start "$cron_daemon_name"; sleep 2
+                if systemctl is-active --quiet "$cron_daemon_name"; then green "Cron服务 ($cron_daemon_name) 已成功启动。"; cron_service_active=true;
+                else red "错误: 无法启动Cron服务 ($cron_daemon_name)。自动续签将无法工作。"; fi
+            fi
+
+            local cron_job_set_successfully=false
+            if $cron_service_active; then
+                local current_crontab_content=$(crontab -l 2>/dev/null)
+                local acme_cron_cmd=$(printf "0 0 * * * %s --cron -f >/dev/null 2>&1" "\"$ACME_SH_PATH\"")
+                local new_crontab_content=$(echo -e "${current_crontab_content}" | grep -vF "\"$ACME_SH_PATH\" --cron")
+                new_crontab_content=$(echo -e "${new_crontab_content}\n${acme_cron_cmd}" | sed '/^$/d')
+                if echo "${new_crontab_content}" | crontab -; then green "用户crontab更新成功 (尝试)。"; fi
+                sleep 1
+                if crontab -l 2>/dev/null | grep -qF "\"$ACME_SH_PATH\" --cron" ; then
+                     green "acme.sh 证书自动续签的cron任务已成功设置/验证。"; cron_job_set_successfully=true;
+                fi
+            fi
+            if ! $cron_job_set_successfully; then
+                 yellow "警告: 未能自动设置acme.sh的cron续签任务。"; yellow "请手动添加以下行到root用户的crontab:0 0 * * * \"$ACME_SH_PATH\" --cron -f >/dev/null 2>&1";
+            fi
+
+            apply_cert_permissions "$key_path" "$cert_path"
+            green "证书申请与安装成功!"; yellow "证书: $cert_path, 私钥: $key_path"
+        else red "证书文件 ($cert_path, $key_path) 未生成或为空。"; return 1; fi
+    else red "acme.sh --install-cert 失败。"; return 1; fi
+    # USE_INSECURE_CLIENT_CONFIG is already "false"
+    return 0 # Success
 }
 
 inst_port(){
@@ -427,20 +321,11 @@ insthysteria(){
     [[ -z "$ip" ]] && red "错误：无法获取服务器的公网IP地址！ Hysteria安装中止。" && exit 1
     yellow "脚本初步检测到服务器IP为: $ip (后续证书申请流程可能会根据DNS验证更新此IP)"
 
-    # Packages needed for Hysteria setup, excluding those handled by initial ensure_tool or ACME-specific logic
-    local essential_setup_pkgs=("sudo" "procps") # procps for 'ss'
-    
-    if [[ "$SYSTEM" == "CentOS" || "$SYSTEM" == "Fedora" || "$SYSTEM" == "Rocky" || "$SYSTEM" == "Alma" ]]; then
-        ensure_tool "crontab" "cronie" # Ensure cronie and thus crontab command
-    else
-        ensure_tool "crontab" "cron"   # Ensure cron and thus crontab command
-    fi
-    ensure_tool "ss" "procps" # Specifically check for ss from procps
-
-    for pkg_name_full in "${essential_setup_pkgs[@]}"; do
-        if [[ "$pkg_name_full" == "procps" ]]; then continue; fi # Already handled by ensure_tool "ss" "procps"
-        ensure_tool "$pkg_name_full" "$pkg_name_full" # Assume tool name is package name
-    done
+    # Ensure essential setup packages for Debian 12
+    ensure_tool "sudo" "sudo"
+    ensure_tool "ss" "procps" # For port checking
+    ensure_tool "crontab" "cron" # For acme.sh auto-renewal
+    ensure_tool "iptables-persistent" "iptables-persistent" # For saving firewall rules
 
 
     if [[ ! -f "/usr/local/bin/hysteria" ]]; then
@@ -451,7 +336,10 @@ insthysteria(){
 
     if [[ -f "/usr/local/bin/hysteria" ]]; then green "Hysteria 2 主程序准备就绪！"; else red "Hysteria 2 主程序安装失败或未找到！"; exit 1; fi
 
-    inst_cert
+    if ! inst_cert; then # inst_cert now returns 0 on success, 1 on failure
+        red "证书配置失败，安装中止。"
+        exit 1
+    fi
     inst_port
     inst_pwd
     inst_site
@@ -482,14 +370,10 @@ masquerade:
     rewriteHost: true
 EOF
 
-    local client_tls_insecure_bool_value="true"
-    local client_tls_insecure_int_value="1"
-    if [[ "$USE_INSECURE_CLIENT_CONFIG" == "false" ]]; then
-        client_tls_insecure_bool_value="false"; client_tls_insecure_int_value="0"
-        green "客户端配置将使用 'insecure: false' (证书将被验证)。"
-    else
-        yellow "客户端配置将使用 'insecure: true' (证书将不被严格验证)。"
-    fi
+    # USE_INSECURE_CLIENT_CONFIG is always "false" now due to ACME only
+    local client_tls_insecure_bool_value="false"
+    local client_tls_insecure_int_value="0"
+    green "客户端配置将使用 'insecure: false' (证书将被验证)。"
 
     local config_port_for_client="$port"
     if [[ -n "$firstport" && -n "$endport" && "$firstport" -lt "$endport" ]]; then
@@ -510,14 +394,11 @@ fastOpen: true
 socks5: {listen: 127.0.0.1:5678}
 transport: {udp: {hopInterval: 30s}}
 EOF
-    local json_insecure_val="$client_tls_insecure_bool_value"
-    if [[ "$json_insecure_val" != "true" && "$json_insecure_val" != "false" ]]; then json_insecure_val="true"; fi
-
     cat << EOF > /root/hy/hy-client.json
 {
   "server": "$config_ip_for_client:$config_port_for_client",
   "auth": "$auth_pwd",
-  "tls": { "sni": "$hy_domain", "insecure": $json_insecure_val },
+  "tls": { "sni": "$hy_domain", "insecure": false },
   "quic": {"initStreamReceiveWindow": 16777216, "maxStreamReceiveWindow": 16777216, "initConnReceiveWindow": 33554432, "maxConnReceiveWindow": 33554432},
   "socks5": {"listen": "127.0.0.1:5678"},
   "transport": {"udp": {"hopInterval": "30s"}}
@@ -527,7 +408,7 @@ EOF
     local share_link_ip_formatted="$ip"
     if [[ "$ip" == *":"* ]]; then share_link_ip_formatted="[$ip]"; fi
 
-    url="hysteria2://$auth_pwd@$share_link_ip_formatted:$config_port_for_client/?insecure=$client_tls_insecure_int_value&sni=$hy_domain#Hysteria2-$(echo $SYS | awk '{print $1}')-$(date +%m%d)"
+    url="hysteria2://$auth_pwd@$share_link_ip_formatted:$config_port_for_client/?insecure=$client_tls_insecure_int_value&sni=$hy_domain#Hysteria2-Debian12-$(date +%m%d)"
     echo "$url" > /root/hy/url.txt
 
     systemctl daemon-reload
@@ -544,7 +425,7 @@ EOF
         red "Hysteria 2 服务 ($SYSTEMD_SERVICE_NAME) 启动失败"; yellow "请运行 'systemctl status $SYSTEMD_SERVICE_NAME' 和 'journalctl -u $SYSTEMD_SERVICE_NAME -n 50 --no-pager' 查看日志。"; exit 1;
     fi
     red "======================================================================================"
-    green "Hysteria 2 代理服务安装完成"
+    green "Hysteria 2 代理服务安装完成 (Debian 12 专用版)"
     showconf
     echo ""
     yellow "重要: 如果您使用了端口跳跃，请确保客户端支持该格式的端口定义 (port,start-end)。"
@@ -573,14 +454,9 @@ unsthysteria(){
     rm -rf /usr/local/bin/hysteria /etc/hysteria /root/hy
 
     local acme_cron_cmd_pattern="\"$HOME/.acme.sh/acme.sh\" --cron"
-    if grep -qF "$acme_cron_cmd_pattern" /etc/crontab 2>/dev/null || crontab -l 2>/dev/null | grep -qF "$acme_cron_cmd_pattern"; then
+    if crontab -l 2>/dev/null | grep -qF "$acme_cron_cmd_pattern"; then # Debian uses user crontab for root
         green "正在移除acme.sh的cron任务..."
         (crontab -l 2>/dev/null | grep -vF "$acme_cron_cmd_pattern") | crontab -
-        if [[ -w /etc/crontab && ("$SYSTEM" == "CentOS" || "$SYSTEM" == "Fedora" || "$SYSTEM" == "Rocky" || "$SYSTEM" == "Alma") ]]; then
-             local cron_pattern_escaped_for_sed
-             cron_pattern_escaped_for_sed=$(printf '%s\n' "$acme_cron_cmd_pattern" | sed 's/[\/\.*^$[]/\\&/g')
-             sed -i "/${cron_pattern_escaped_for_sed}/d" /etc/crontab
-        fi
     fi
 
     green "正在移除由本脚本添加的iptables端口跳跃规则 (带注释 $PORT_JUMP_COMMENT)..."
@@ -641,49 +517,33 @@ hysteriaswitch(){
     [[ "$switchInput" != "0" ]] && read -n 1 -s -r -p "按任意键返回操作菜单..." && hysteriaswitch "menu_return"
 }
 
-update_client_configs_insecure_flag() {
-    local bool_val="$1"
-    local int_val="$2"
+# update_client_configs_insecure_flag is no longer strictly needed as USE_INSECURE_CLIENT_CONFIG is always false.
+# However, change_cert could call it if it were to re-introduce other cert types.
+# For now, it's simpler as inst_cert always results in USE_INSECURE_CLIENT_CONFIG="false"
+# update_client_configs_insecure_flag() { ... } # Removed for brevity
 
-    if [[ -f /root/hy/hy-client.yaml ]]; then
-        sed -i "s/insecure: \(true\|false\)/insecure: $bool_val/g" /root/hy/hy-client.yaml
-    fi
-    if [[ -f /root/hy/hy-client.json ]]; then
-        local json_val_to_set="$bool_val"
-        if [[ "$json_val_to_set" != "true" && "$json_val_to_set" != "false" ]]; then json_val_to_set="true"; fi
-        sed -i "s/\"insecure\": \(true\|false\)/\"insecure\": $json_val_to_set/g" /root/hy/hy-client.json
-    fi
-    if [[ -f /root/hy/url.txt ]]; then
-        sed -i "s/insecure=[01]/insecure=$int_val/g" /root/hy/url.txt
-    fi
-}
-
-change_cert(){
+change_cert(){ # This function now effectively means "Re-run ACME for a new/existing domain"
     if [[ ! -f /etc/hysteria/config.yaml ]]; then red "Hysteria 未安装。" && return; fi
     get_systemd_service_name; if [[ -z "$SYSTEMD_SERVICE_NAME" ]]; then red "Hysteria服务名未知!" && return; fi
 
-    local old_cert_path_from_config=$(grep -oP 'cert: \K\S+' /etc/hysteria/config.yaml)
-    local old_key_path_from_config=$(grep -oP 'key: \K\S+' /etc/hysteria/config.yaml)
     local old_hy_domain_client="N/A"; [[ -f /root/hy/hy-client.yaml ]] && old_hy_domain_client=$(grep -oP 'sni: \K\S+' /root/hy/hy-client.yaml || echo "N/A")
-
     local preserved_ip_before_cert_change="$ip"
 
-    inst_cert # Updates globals: USE_INSECURE_CLIENT_CONFIG, cert_path, key_path, hy_domain, maybe ip. Sets perms.
+    if ! inst_cert; then # inst_cert now returns 0 on success, 1 on failure
+        red "证书更新/申请流程失败。"
+        return 1
+    fi
+    # inst_cert updated globals: USE_INSECURE_CLIENT_CONFIG (to false), cert_path, key_path (to /etc/hysteria/...), hy_domain, and $ip.
 
-    local std_cert_path="/etc/hysteria/cert.crt"; local std_key_path="/etc/hysteria/private.key"
-    local esc_std_cert_path=$(printf '%s\n' "$std_cert_path" | sed 's:[][\/.^$*]:\\&:g')
-    local esc_std_key_path=$(printf '%s\n' "$std_key_path" | sed 's:[][\/.^$*]:\\&:g')
-    local esc_old_cert_path=$(printf '%s\n' "$old_cert_path_from_config" | sed 's:[][\/.^$*]:\\&:g')
-    local esc_old_key_path=$(printf '%s\n' "$old_key_path_from_config" | sed 's:[][\/.^$*]:\\&:g')
-    sed -i "s|cert: $esc_old_cert_path|cert: $esc_std_cert_path|g" /etc/hysteria/config.yaml
-    sed -i "s|key: $esc_old_key_path|key: $esc_std_key_path|g" /etc/hysteria/config.yaml
-
+    # Hysteria server config already points to /etc/hysteria/cert.crt and private.key
+    # SNI in client configs needs update if hy_domain changed
     local escaped_old_sni=$(printf '%s\n' "$old_hy_domain_client" | sed 's:[][\/.^$*]:\\&:g')
     local escaped_new_sni=$(printf '%s\n' "$hy_domain" | sed 's:[][\/.^$*]:\\&:g')
     if [[ -f /root/hy/hy-client.yaml ]]; then sed -i "s/sni: $escaped_old_sni/sni: $escaped_new_sni/g" /root/hy/hy-client.yaml; fi
     if [[ -f /root/hy/hy-client.json ]]; then sed -i "s/\"sni\": \"$escaped_old_sni\"/\"sni\": \"$escaped_new_sni\"/g" /root/hy/hy-client.json; fi
     if [[ -f /root/hy/url.txt ]]; then sed -i "s/sni=$escaped_old_sni/sni=$escaped_new_sni/g" /root/hy/url.txt; fi
 
+    # Update server IP in client configs if it changed due to ACME validation
     if [[ "$ip" != "$preserved_ip_before_cert_change" && -n "$preserved_ip_before_cert_change" ]]; then
         yellow "服务器IP因ACME验证已更新为: $ip。更新客户端配置中的服务器地址..."
         local old_client_ip_f="$preserved_ip_before_cert_change"; if [[ "$preserved_ip_before_cert_change" == *":"* ]]; then old_client_ip_f="[$preserved_ip_before_cert_change]"; fi
@@ -692,14 +552,15 @@ change_cert(){
         local esc_new_client_ip_f=$(printf '%s\n' "$new_client_ip_f" | sed 's:[][\/.^$*]:\\&:g')
         if [[ -f /root/hy/hy-client.yaml ]]; then sed -i "s|server: $esc_old_client_ip_f:|server: $esc_new_client_ip_f:|g" /root/hy/hy-client.yaml; fi
         if [[ -f /root/hy/hy-client.json ]]; then sed -i "s|\"server\": \"$esc_old_client_ip_f:|\"server\": \"$esc_new_client_ip_f:|g" /root/hy/hy-client.json; fi
-        local escaped_old_ip_url_at="@$(printf '%s\n' "$old_client_ip_f" | sed 's:[][\/.^$*]:\\&:g')" 
+        local escaped_old_ip_url_at="@$(printf '%s\n' "$old_client_ip_f" | sed 's:[][\/.^$*]:\\&:g')"
         local escaped_new_ip_url_at="@$(printf '%s\n' "$new_client_ip_f" | sed 's:[][\/.^$*]:\\&:g')"
         if [[ -f /root/hy/url.txt ]]; then sed -i "s|$escaped_old_ip_url_at|$escaped_new_ip_url_at|g" /root/hy/url.txt; fi
     fi
 
-    local bool_val_change="true"; local int_val_change="1"
-    if [[ "$USE_INSECURE_CLIENT_CONFIG" == "false" ]]; then bool_val_change="false"; int_val_change="0"; fi
-    update_client_configs_insecure_flag "$bool_val_change" "$int_val_change"
+    # Client 'insecure' flag is always false now
+    if [[ -f /root/hy/hy-client.yaml ]]; then sed -i "s/insecure: \(true\|false\)/insecure: false/g" /root/hy/hy-client.yaml; fi
+    if [[ -f /root/hy/hy-client.json ]]; then sed -i "s/\"insecure\": \(true\|false\)/\"insecure\": false/g" /root/hy/hy-client.json; fi
+    if [[ -f /root/hy/url.txt ]]; then sed -i "s/insecure=[01]/insecure=0/g" /root/hy/url.txt; fi
 
     systemctl restart "$SYSTEMD_SERVICE_NAME"
     if [[ -n $(systemctl status "$SYSTEMD_SERVICE_NAME" 2>/dev/null | grep -w active) ]]; then
@@ -732,8 +593,10 @@ changeport(){
     if [[ -f /root/hy/hy-client.yaml ]]; then sed -i "s/\(server: $esc_client_ip_f\):$old_server_port/\1:$new_port/" /root/hy/hy-client.yaml; fi
     if [[ -f /root/hy/hy-client.json ]]; then sed -i "s/\(\"server\": \"$esc_client_ip_f\):$old_server_port/\1:$new_port/" /root/hy/hy-client.json; fi
     if [[ -f /root/hy/url.txt ]]; then
-        local esc_at_client_ip_f="@$esc_client_ip_f"
-        sed -i "s/\($esc_at_client_ip_f\):$old_server_port/\1:$new_port/" /root/hy/url.txt
+        local esc_at_client_ip_f="@$esc_client_ip_f" # No, this was wrong, need to escape $client_ip_f fully
+        local esc_at_client_ip_f_prefix="@$(printf '%s\n' "$client_ip_f" | sed 's:[][\/.^$*]:\\&:g')"
+
+        sed -i "s/\(${esc_at_client_ip_f_prefix}\):$old_server_port/\1:$new_port/" /root/hy/url.txt
     fi
 
     systemctl restart "$SYSTEMD_SERVICE_NAME"
@@ -793,9 +656,9 @@ changeconf(){
     if [[ ! -f "/etc/hysteria/config.yaml" ]]; then
         red "Hysteria 2 未安装。"; read -n 1 -s -r -p "按任意键返回主菜单..." && menu && return
     fi
-    echo ""; green "Hysteria 2 配置变更选择:"
+    echo ""; green "Hysteria 2 配置变更选择 (Debian 12 专用版):"
     echo -e " ${GREEN}1.${PLAIN} 修改监听端口"; echo -e " ${GREEN}2.${PLAIN} 修改连接密码"
-    echo -e " ${GREEN}3.${PLAIN} 修改证书"; echo -e " ${GREEN}4.${PLAIN} 修改伪装网站"
+    echo -e " ${GREEN}3.${PLAIN} 修改/重新申请ACME证书"; echo -e " ${GREEN}4.${PLAIN} 修改伪装网站"
     echo -e " ${GREEN}0.${PLAIN} 返回主菜单"; echo ""
     read -p " 请选择操作 [0-4]：" confAnswer
     case $confAnswer in
@@ -826,8 +689,8 @@ showconf(){
 menu() {
     clear
     echo "#############################################################"
-    echo -e "#         ${GREEN}Hysteria 2 一键安装脚本 (增强版)${PLAIN}         #"
-    echo -e "#       ${YELLOW}作者: Misaka, Gemini (改进版)${PLAIN}         #"
+    echo -e "#      ${GREEN}Hysteria 2 一键安装脚本 (Debian 12 专用版)${PLAIN}     #"
+    echo -e "#       ${YELLOW}作者: Misaka, Gemini (精简/改进版)${PLAIN}        #"
     echo "#############################################################"
     echo ""; echo -e " ${GREEN}1.${PLAIN} 安装 Hysteria 2"; echo -e " ${RED}2.${PLAIN} 卸载 Hysteria 2"
     echo " ------------------------------------------------------------"
