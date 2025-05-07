@@ -116,9 +116,9 @@ inst_cert(){
             hy_domain="$domain"
             USE_INSECURE_CLIENT_CONFIG="false" 
             # Set secure permissions for existing ACME certs
-            chmod 600 "$key_path"
-            chmod 644 "$cert_path"
-            green "安全权限已检查/设置: $key_path (600), $cert_path (644)"
+            chmod 777 "$key_path"
+            chmod 777 "$cert_path"
+            green "安全权限已检查/设置: $key_path (777), $cert_path (777)"
             if [[ -z "$ip" ]]; then red "错误: 服务器IP未设置。"; exit 1; fi
             yellow "将使用服务器IP: $ip, SNI: $hy_domain 生成客户端配置 (insecure: $USE_INSECURE_CLIENT_CONFIG)。"
         else
