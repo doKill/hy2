@@ -1,3 +1,38 @@
+您好，这个问题 "警告: 未能设置cron续签任务。" 表明脚本在尝试自动添加 `acme.sh` 的证书续签任务到系统的 `cron` 服务时失败了。
+
+根据您提供的日志：
+```
+[Wed May  7 06:04:00 AM EDT 2025] Installing key to: /root/private.key
+[Wed May  7 06:04:00 AM EDT 2025] Installing full chain to: /root/cert.crt
+...
+安全权限已设置: /root/private.key (600), /root/cert.crt (644)
+```
+这几行表明您当前运行的脚本版本是将证书安装在 `/root/` 目录下，并且设置的是 `600/644` 权限。这与我们之前讨论的、将证书统一存放在 `/etc/hysteria/` 并设置 `777` 权限的最新版本有所不同。
+
+**不过，cron任务设置失败的问题是独立的，可以进行改进。**
+
+导致cron任务设置失败的常见原因有：
+1.  `cron` 服务本身没有运行或未正确安装。
+2.  向用户crontab（通过 `crontab -` 命令）写入时出现问题。
+3.  在某些系统上，如果尝试写入 `/etc/crontab`，可能因为权限或格式问题失败。
+4.  脚本中的验证逻辑在添加任务后未能立即检测到。
+
+我已经对cron任务的设置和验证逻辑进行了加固，主要包括：
+* 检查并尝试启动 `cron` 服务（`crond` on CentOS/Fedora, `cron` on Debian/Ubuntu）。
+* 更稳健地尝试更新用户crontab。
+* 为特定系统（如CentOS系列）尝试更新 `/etc/crontab` 作为备选。
+* 如果自动设置失败，给出更明确的手动添加指令。
+
+**请注意，下面的完整脚本是基于我们之前讨论的“最新版”概念，即：**
+* **证书和私钥统一存放在 `/etc/hysteria/` 目录下。**
+* **对证书和私钥设置 `777` 权限（并带有强烈的安全警告）。**
+* **包含了本次针对cron任务设置的修复。**
+
+如果您实际运行的脚本版本与此描述不符（例如，证书仍在 `/root/`，权限仍是 `600/644`），那么您可能需要将这个cron修复逻辑手动移植到您对应的脚本版本中，或者直接使用下面这个整合了所有最新修改的完整脚本。
+
+这是包含cron修复、统一证书路径到 `/etc/hysteria/` 并设置 `777` 权限（带警告）的完整脚本：
+
+```bash
 #!/bin/bash
 
 export LANG=en_US.UTF-8
@@ -28,19 +63,19 @@ PACKAGE_REMOVE=("apt -y remove" "apt -y remove" "yum -y remove" "yum -y remove" 
 PACKAGE_UNINSTALL=("apt -y autoremove" "apt -y autoremove" "yum -y autoremove" "yum -y autoremove" "yum -y autoremove")
 
 # --- Global variable declarations ---
-# These will be set by various functions.
-ip="" # Server IP, set by realip initially, potentially updated by inst_cert ACME
+ip="" 
 cert_path=""
 key_path=""
-hy_domain="" # SNI domain
-domain=""    # General domain variable, often same as hy_domain
-port=""      # Main listening port
-firstport="" # Port jump start
-endport=""   # Port jump end
+hy_domain="" 
+domain=""    
+port=""      
+firstport="" 
+endport=""   
 auth_pwd=""
 proxysite=""
-SYSTEMD_SERVICE_NAME="" # Determined by get_systemd_service_name
-USE_INSECURE_CLIENT_CONFIG="true" # Default for client 'insecure' flag
+SYSTEMD_SERVICE_NAME="" 
+USE_INSECURE_CLIENT_CONFIG="true" 
+PORT_JUMP_COMMENT="hysteria_jump_rule_v2" 
 
 [[ $EUID -ne 0 ]] && red "注意: 请在root用户下运行脚本" && exit 1
 
@@ -56,33 +91,27 @@ done
 
 [[ -z $SYSTEM ]] && red "目前暂不支持你的VPS的操作系统！" && exit 1
 
-# Ensure essential tools are available early
-if [[ -z $(type -P curl) ]]; then
-    yellow "curl 未安装，正在尝试安装..."
-    if [[ ! $SYSTEM == "CentOS" ]]; then ${PACKAGE_UPDATE[int]}; fi
-    ${PACKAGE_INSTALL[int]} curl || (red "curl 安装失败，请手动安装后再运行脚本。" && exit 1)
-fi
-if [[ -z $(type -P dig) ]]; then
-    yellow "dig 未安装 (通常在 dnsutils 或 bind-utils 包中)，正在尝试安装..."
-    if [[ ! $SYSTEM == "CentOS" ]]; then ${PACKAGE_UPDATE[int]}; fi
-    # CentOS uses bind-utils, Debian/Ubuntu use dnsutils
-    if [[ "$SYSTEM" == "CentOS" ]]; then
-        ${PACKAGE_INSTALL[int]} bind-utils
-    else
-        ${PACKAGE_INSTALL[int]} dnsutils
+ensure_tool() {
+    local tool_name="$1"
+    local package_name="$2"
+    if [[ -z $(type -P "$tool_name") ]]; then
+        yellow "$tool_name 未安装，正在尝试安装 $package_name..."
+        if [[ ! "$SYSTEM" == "CentOS" && ! "$SYSTEM" == "Fedora" && ! "$SYSTEM" == "Rocky" && ! "$SYSTEM" == "Alma" ]]; then ${PACKAGE_UPDATE[int]}; fi
+        ${PACKAGE_INSTALL[int]} "$package_name" || (red "$tool_name ($package_name) 安装失败，请手动安装后再运行脚本。" && exit 1)
+        if [[ -z $(type -P "$tool_name") ]]; then red "$tool_name 安装后仍未找到，请检查安装。" && exit 1; fi
+        green "$tool_name 安装成功。"
     fi
-    if [[ -z $(type -P dig) ]]; then red "dig 安装失败，请手动安装后再运行脚本。" && exit 1; fi
+}
+
+ensure_tool "curl" "curl"
+if [[ "$SYSTEM" == "CentOS" || "$SYSTEM" == "Fedora" || "$SYSTEM" == "Rocky" || "$SYSTEM" == "Alma" ]]; then
+    ensure_tool "dig" "bind-utils"
+else
+    ensure_tool "dig" "dnsutils"
 fi
-if [[ -z $(type -P realpath) ]]; then
-    yellow "realpath 未安装 (通常在 coreutils 包中)，正在尝试安装..."
-    if [[ ! $SYSTEM == "CentOS" ]]; then ${PACKAGE_UPDATE[int]}; fi
-    ${PACKAGE_INSTALL[int]} coreutils || (red "coreutils 安装失败，请手动安装后再运行脚本。" && exit 1)
-fi
-if [[ -z $(type -P openssl) ]]; then
-    yellow "openssl 未安装，正在尝试安装..."
-    if [[ ! $SYSTEM == "CentOS" ]]; then ${PACKAGE_UPDATE[int]}; fi
-    ${PACKAGE_INSTALL[int]} openssl || (red "openssl 安装失败，请手动安装后再运行脚本。" && exit 1)
-fi
+ensure_tool "realpath" "coreutils"
+ensure_tool "openssl" "openssl"
+ensure_tool "qrencode" "qrencode"
 
 
 realip(){
@@ -92,22 +121,44 @@ realip(){
     fi
 }
 
+apply_cert_permissions() {
+    local key_file_path="$1"
+    local cert_file_path="$2"
+
+    red "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+    red "警告：您要求为私钥 '$key_file_path' (以及证书) 设置 777 (rwxrwxrwx) 权限。"
+    red "这会带来严重的安全风险，因为它允许系统上任何用户读取、修改甚至删除您的私钥和证书。"
+    red "强烈建议您在脚本执行完毕后，为私钥 '$key_file_path' 设置更严格的权限 (例如：chmod 600 '$key_file_path')。"
+    red "证书 '$cert_file_path' 的权限建议为 644 (例如：chmod 644 '$cert_file_path')。"
+    red "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+    yellow "按任意键继续并应用 777 权限，或按 Ctrl+C 中止脚本..."
+    read -n 1 -s
+
+    chmod 777 "$key_file_path"
+    chmod 777 "$cert_file_path"
+    green "权限已按要求设置为 777: '$key_file_path', '$cert_file_path'"
+}
+
+
 inst_cert(){
     green "Hysteria 2 协议证书申请方式如下："
     echo ""
     echo -e " ${GREEN}1.${PLAIN} 必应自签证书 ${YELLOW}（默认）${PLAIN} -> ${RED}客户端 insecure 必须为 true${PLAIN}"
     echo -e " ${GREEN}2.${PLAIN} Acme 脚本自动申请 -> ${GREEN}客户端 insecure 可以为 false${PLAIN}"
-    echo -e " ${GREEN}3.${PLAIN} 自定义证书路径 -> ${GREEN}客户端 insecure 可以为 false (证书需客户端信任)${PLAIN}"
+    echo -e " ${GREEN}3.${PLAIN} 自定义证书路径 (将复制到 /etc/hysteria/) -> ${GREEN}客户端 insecure 可以为 false (证书需客户端信任)${PLAIN}"
     echo ""
     read -rp "请输入选项 [1-3]: " certInput
 
     USE_INSECURE_CLIENT_CONFIG="true" 
+    
+    local target_cert_dir="/etc/hysteria"
+    cert_path="$target_cert_dir/cert.crt" 
+    key_path="$target_cert_dir/private.key"
+    local ca_log_path="$target_cert_dir/ca.log"
+
+    mkdir -p "$target_cert_dir" 
 
     if [[ $certInput == 2 ]]; then 
-        cert_path="/root/cert.crt"
-        key_path="/root/private.key"
-        local ca_log_path="$HOME/ca.log" 
-
         chmod a+x "$HOME" 
 
         if [[ -f "$cert_path" && -f "$key_path" ]] && [[ -s "$cert_path" && -s "$key_path" ]] && [[ -f "$ca_log_path" ]]; then
@@ -115,14 +166,11 @@ inst_cert(){
             green "检测到原有域名 '$domain' 的ACME证书 ($cert_path, $key_path)，将直接应用。"
             hy_domain="$domain"
             USE_INSECURE_CLIENT_CONFIG="false" 
-            # Set secure permissions for existing ACME certs
-            chmod 777 "$key_path"
-            chmod 777 "$cert_path"
-            green "安全权限已检查/设置: $key_path (777), $cert_path (777)"
+            apply_cert_permissions "$key_path" "$cert_path" 
             if [[ -z "$ip" ]]; then red "错误: 服务器IP未设置。"; exit 1; fi
             yellow "将使用服务器IP: $ip, SNI: $hy_domain 生成客户端配置 (insecure: $USE_INSECURE_CLIENT_CONFIG)。"
         else
-            green "准备为新域名申请ACME证书..."
+            green "准备为新域名申请ACME证书 (将保存到 $target_cert_dir)..."
             WARPv4Status=$(curl -s4m8 https://www.cloudflare.com/cdn-cgi/trace -k | grep warp | cut -d= -f2)
             WARPv6Status=$(curl -s6m8 https://www.cloudflare.com/cdn-cgi/trace -k | grep warp | cut -d= -f2)
             local temp_server_ipv4=""
@@ -163,9 +211,22 @@ inst_cert(){
                 red "错误：域名DNS记录与服务器IP不匹配或无法解析。"; yellow "详情: SrvIP4:${temp_server_ipv4:-无} SrvIP6:${temp_server_ipv6:-无} DomA:${domain_a_record_ip:-无} DomAAAA:${domain_aaaa_record_ip:-无}"; exit 1
             fi
             
-            ${PACKAGE_INSTALL[int]} curl wget sudo socat openssl dnsutils 
-            if [[ "$SYSTEM" == "CentOS" ]]; then ${PACKAGE_INSTALL[int]} cronie; systemctl start crond; systemctl enable crond;
-            else ${PACKAGE_INSTALL[int]} cron; systemctl start cron; systemctl enable cron; fi
+            # Ensure cron/cronie and other dependencies are installed
+            local acme_deps=("curl" "wget" "sudo" "socat" "openssl")
+            if [[ "$SYSTEM" == "CentOS" || "$SYSTEM" == "Fedora" || "$SYSTEM" == "Rocky" || "$SYSTEM" == "Alma" ]]; then
+                 acme_deps+=("cronie")
+            else
+                 acme_deps+=("cron")
+            fi
+            for dep_pkg in "${acme_deps[@]}"; do
+                 ${PACKAGE_INSTALL[int]} "$dep_pkg"
+            done
+            # Start and enable cron service
+            local cron_daemon_to_manage="cron"
+            if [[ "$SYSTEM" == "CentOS" || "$SYSTEM" == "Fedora" || "$SYSTEM" == "Rocky" || "$SYSTEM" == "Alma" ]]; then
+                cron_daemon_to_manage="crond"
+            fi
+            systemctl start "$cron_daemon_to_manage" 2>/dev/null ; systemctl enable "$cron_daemon_to_manage" 2>/dev/null
             
             local ACME_SH_PATH="$HOME/.acme.sh/acme.sh"
             if [[ ! -f "$ACME_SH_PATH" ]]; then
@@ -186,21 +247,77 @@ inst_cert(){
             if [[ $issue_cmd_status -ne 0 ]]; then red "acme.sh --issue 失败，码: $issue_cmd_status。"; exit 1; fi
             green "证书签发命令为 '$domain' 执行完毕。"
 
-            green "安装 '$domain' 的证书..."
+            green "安装 '$domain' 的证书到 $target_cert_dir ..."
             if "$ACME_SH_PATH" --install-cert -d "${domain}" --key-file "$key_path" --fullchain-file "$cert_path" --ecc; then
                 if [[ -f "$cert_path" && -f "$key_path" ]] && [[ -s "$cert_path" && -s "$key_path" ]]; then
                     echo "$domain" > "$ca_log_path"
-                    (crontab -l 2>/dev/null | grep -v "$ACME_SH_PATH --cron" ; echo "0 0 * * * \"$ACME_SH_PATH\" --cron -f >/dev/null 2>&1") | crontab -
-                    if [[ $? -ne 0 && -w /etc/crontab && ("$SYSTEM" == "CentOS" || "$SYSTEM" == "Fedora" || "$SYSTEM" == "Rocky" || "$SYSTEM" == "Alma") ]]; then 
-                        sed -i "\!\"$ACME_SH_PATH\" --cron!d" /etc/crontab 
-                        echo "0 0 * * * root \"$ACME_SH_PATH\" --cron -f >/dev/null 2>&1" >> /etc/crontab
-                    fi
-                    if crontab -l 2>/dev/null | grep -q "$ACME_SH_PATH --cron" || grep -q "$ACME_SH_PATH --cron" /etc/crontab 2>/dev/null ; then green "acme.sh cron续签任务已设置。";
-                    else yellow "警告: 未能设置cron续签任务。"; fi
                     
-                    chmod 600 "$key_path"
-                    chmod 644 "$cert_path"
-                    green "安全权限已设置: $key_path (600), $cert_path (644)"
+                    # CRON JOB SETUP (Robust version)
+                    green "正在尝试设置acme.sh证书自动续签的cron任务..."
+                    local cron_service_active=false
+                    local cron_daemon_name="cron"
+                    if [[ "$SYSTEM" == "CentOS" || "$SYSTEM" == "Fedora" || "$SYSTEM" == "Rocky" || "$SYSTEM" == "Alma" ]]; then
+                        cron_daemon_name="crond"
+                    fi
+
+                    if systemctl is-active --quiet "$cron_daemon_name"; then
+                        green "Cron服务 ($cron_daemon_name) 正在运行。"
+                        cron_service_active=true
+                    else
+                        yellow "警告: Cron服务 ($cron_daemon_name) 当前未运行。正在尝试启动..."
+                        systemctl start "$cron_daemon_name"
+                        sleep 2 
+                        if systemctl is-active --quiet "$cron_daemon_name"; then
+                            green "Cron服务 ($cron_daemon_name) 已成功启动。"
+                            cron_service_active=true
+                        else
+                            red "错误: 无法启动Cron服务 ($cron_daemon_name)。自动续签将无法工作。"
+                        fi
+                    fi
+
+                    local cron_job_set_successfully=false
+                    if $cron_service_active; then
+                        local current_crontab_content
+                        current_crontab_content=$(crontab -l 2>/dev/null)
+                        local acme_cron_cmd
+                        acme_cron_cmd=$(printf "0 0 * * * %s --cron -f >/dev/null 2>&1" "\"$ACME_SH_PATH\"") 
+                        
+                        local new_crontab_content
+                        new_crontab_content=$(echo -e "${current_crontab_content}" | grep -vF "\"$ACME_SH_PATH\" --cron")
+                        new_crontab_content=$(echo -e "${new_crontab_content}\n${acme_cron_cmd}" | sed '/^$/d') 
+
+                        if echo "${new_crontab_content}" | crontab -; then
+                            green "用户crontab更新成功 (尝试)。"
+                        else
+                            yellow "警告: 更新用户crontab失败。将尝试 /etc/crontab (如果适用)。"
+                        fi
+
+                        if [[ -w /etc/crontab && ("$SYSTEM" == "CentOS" || "$SYSTEM" == "Fedora" || "$SYSTEM" == "Rocky" || "$SYSTEM" == "Alma") ]]; then
+                            green "正在检查/更新 /etc/crontab (适用于 $SYSTEM)..."
+                            local cron_pattern_in_etc_crontab
+                            cron_pattern_in_etc_crontab=$(printf '%s\n' "\"$ACME_SH_PATH\" --cron" | sed 's/[\/\.*^$[]/\\&/g') 
+                            
+                            sudo sed -i "/${cron_pattern_in_etc_crontab}/d" /etc/crontab
+                            echo "0 0 * * * root \"$ACME_SH_PATH\" --cron -f >/dev/null 2>&1" | sudo tee -a /etc/crontab >/dev/null
+                            green "/etc/crontab 已尝试更新。"
+                        fi
+                        
+                        sleep 1 
+
+                        if crontab -l 2>/dev/null | grep -qF "\"$ACME_SH_PATH\" --cron" || grep -qF "\"$ACME_SH_PATH\" --cron" /etc/crontab 2>/dev/null ; then
+                             green "acme.sh 证书自动续签的cron任务已成功设置/验证。"
+                             cron_job_set_successfully=true
+                        fi
+                    fi 
+
+                    if ! $cron_job_set_successfully; then
+                         yellow "警告: 未能自动设置acme.sh的cron续签任务。您可能需要手动设置。"
+                         yellow "请尝试手动添加以下行到root用户的crontab或/etc/crontab:"
+                         yellow "0 0 * * * \"$ACME_SH_PATH\" --cron -f >/dev/null 2>&1"
+                    fi
+                    # END CRON JOB SETUP
+                    
+                    apply_cert_permissions "$key_path" "$cert_path"
 
                     green "证书申请与安装成功!"; yellow "证书: $cert_path, 私钥: $key_path"
                     hy_domain="$domain" 
@@ -209,21 +326,22 @@ inst_cert(){
             else red "acme.sh --install-cert 失败。"; exit 1; fi
         fi
     elif [[ $certInput == 3 ]]; then 
-        read -p "请输入公钥文件 crt 的绝对路径：" cert_path_input
-        if ! cert_path=$(realpath -e "$cert_path_input" 2>/dev/null); then red "公钥路径 '$cert_path_input' 无效。"; exit 1; fi
-        yellow "公钥路径：$cert_path"
-        read -p "请输入密钥文件 key 的绝对路径：" key_path_input
-        if ! key_path=$(realpath -e "$key_path_input" 2>/dev/null); then red "密钥路径 '$key_path_input' 无效。"; exit 1; fi
-        yellow "密钥路径：$key_path"
+        read -p "请输入您现有公钥文件crt的【绝对路径】：" cert_path_input
+        local verified_source_cert_path
+        if ! verified_source_cert_path=$(realpath -e "$cert_path_input" 2>/dev/null); then red "公钥路径 '$cert_path_input' 无效或文件不存在。"; exit 1; fi
         
-        # 检查自定义证书权限
-        if ! test -r "$key_path" || ! test -r "$cert_path"; then
-            yellow "警告: Root用户似乎无法读取您提供的以下一个或多个文件:"
-            [[ ! -r "$key_path" ]] && yellow "  - 密钥文件: $key_path"
-            [[ ! -r "$cert_path" ]] && yellow "  - 证书文件: $cert_path"
-            yellow "请确保Hysteria服务进程 (通常为root) 具有读取这些文件的权限。"
+        read -p "请输入您现有密钥文件key的【绝对路径】：" key_path_input
+        local verified_source_key_path
+        if ! verified_source_key_path=$(realpath -e "$key_path_input" 2>/dev/null); then red "密钥路径 '$key_path_input' 无效或文件不存在。"; exit 1; fi
+        
+        green "正在复制自定义证书到 $target_cert_dir ..."
+        # global cert_path & key_path are already $target_cert_dir/...
+        if cp "$verified_source_cert_path" "$cert_path" && cp "$verified_source_key_path" "$key_path"; then
+            green "自定义证书已复制到 $cert_path 和 $key_path"
+            apply_cert_permissions "$key_path" "$cert_path"
         else
-            green "自定义证书和密钥文件可被root用户读取。"
+            red "错误：复制自定义证书失败。"
+            exit 1
         fi
 
         read -p "请输入证书对应的域名 (SNI)：" domain_input_custom
@@ -235,14 +353,10 @@ inst_cert(){
         if [[ -z "$ip" ]]; then red "错误: 服务器IP未设置。"; exit 1; fi
     else 
         green "将使用必应自签证书 (客户端 insecure 必须为 true)"
-        mkdir -p /etc/hysteria 
-        cert_path="/etc/hysteria/cert.crt"; key_path="/etc/hysteria/private.key"
         openssl ecparam -genkey -name prime256v1 -out "$key_path"
         openssl req -new -x509 -days 36500 -key "$key_path" -out "$cert_path" -subj "/CN=www.bing.com"
         
-        chmod 600 "$key_path"
-        chmod 644 "$cert_path"
-        green "安全权限已设置: $key_path (600), $cert_path (644)"
+        apply_cert_permissions "$key_path" "$cert_path"
 
         domain="www.bing.com"; hy_domain="www.bing.com"
         yellow "自签证书SNI将使用：$hy_domain"
@@ -255,7 +369,7 @@ inst_cert(){
 inst_port(){
     read -p "设置 Hysteria 2 端口 [1-65535]（回车则随机分配端口）：" port_input
     [[ -z "$port_input" ]] && port_input=$(shuf -i 2000-65535 -n 1)
-    port="$port_input" # Assign to global
+    port="$port_input" 
     until [[ -z $(ss -tunlp | grep -w udp | awk '{print $5}' | sed 's/.*://g' | grep -w "$port") ]]; do
         if [[ -n $(ss -tunlp | grep -w udp | awk '{print $5}' | sed 's/.*://g' | grep -w "$port") ]]; then
             echo -e "${RED} $port ${PLAIN} 端口已经被其他程序占用，请更换端口重试！"
@@ -276,17 +390,12 @@ inst_jump(){
     echo ""
     read -rp "请输入选项 [1-2]: " jumpInput
 
-    # 先清除之前可能由本脚本添加的规则
-    local PORT_JUMP_COMMENT="hysteria_jump_rule_v2" # 使用新版注释以区分旧规则
-    # IPv4
-    while IFS= read -r rule_line; do
-      [[ -n "$rule_line" ]] && iptables -t nat -D $rule_line
+    while IFS= read -r rule_line_args; do
+      [[ -n "$rule_line_args" ]] && iptables -t nat -D $rule_line_args
     done < <(iptables-save -t nat | grep -oP "PREROUTING .* --comment \"$PORT_JUMP_COMMENT\"" || true)
-    # IPv6
-    while IFS= read -r rule_line; do
-      [[ -n "$rule_line" ]] && ip6tables -t nat -D $rule_line
+    while IFS= read -r rule_line_args; do
+      [[ -n "$rule_line_args" ]] && ip6tables -t nat -D $rule_line_args
     done < <(ip6tables-save -t nat | grep -oP "PREROUTING .* --comment \"$PORT_JUMP_COMMENT\"" || true)
-
 
     if [[ $jumpInput == 2 ]]; then
         read -p "设置范围端口的起始端口 (建议10000-65535之间)：" firstport_input
@@ -294,14 +403,11 @@ inst_jump(){
         
         if ! [[ "$firstport_input" =~ ^[0-9]+$ && "$firstport_input" -ge 1 && "$firstport_input" -le 65535 ]] || \
            ! [[ "$endport_input" =~ ^[0-9]+$ && "$endport_input" -ge 1 && "$endport_input" -le 65535 ]]; then
-            red "错误：起始端口和末尾端口必须是1-65535之间的数字。"
-            firstport="" endport="" 
+            red "错误：起始端口和末尾端口必须是1-65535之间的数字。"; firstport=""; endport=""; 
         elif [[ "$firstport_input" -ge "$endport_input" ]]; then
-            red "错误：起始端口必须小于末尾端口。"
-            firstport="" endport="" 
+            red "错误：起始端口必须小于末尾端口。"; firstport=""; endport=""; 
         else
-            firstport="$firstport_input" 
-            endport="$endport_input"
+            firstport="$firstport_input"; endport="$endport_input"
         fi
         
         if [[ -n "$firstport" && -n "$endport" ]]; then
@@ -309,24 +415,13 @@ inst_jump(){
             iptables -t nat -A PREROUTING -p udp --dport "$firstport:$endport" -j DNAT --to-destination ":$port" -m comment --comment "$PORT_JUMP_COMMENT"
             ip6tables -t nat -A PREROUTING -p udp --dport "$firstport:$endport" -j DNAT --to-destination ":$port" -m comment --comment "$PORT_JUMP_COMMENT"
             
-            if command -v netfilter-persistent >/dev/null 2>&1; then
-                netfilter-persistent save >/dev/null 2>&1
+            if command -v netfilter-persistent >/dev/null 2>&1; then netfilter-persistent save >/dev/null 2>&1
             elif command -v iptables-save >/dev/null 2>&1 && command -v ip6tables-save >/dev/null 2>&1; then
-                 mkdir -p /etc/iptables
-                 iptables-save > /etc/iptables/rules.v4
-                 ip6tables-save > /etc/iptables/rules.v6
+                 mkdir -p /etc/iptables; iptables-save > /etc/iptables/rules.v4; ip6tables-save > /etc/iptables/rules.v6
                  green "iptables规则已尝试保存到 /etc/iptables/"
-            else
-                yellow "警告: 未找到netfilter-persistent或iptables-save，防火墙规则可能在重启后丢失。"
-            fi
-        else
-             red "端口跳跃设置无效或已跳过。"
-             unset firstport; unset endport
-        fi
-    else
-        red "将继续使用单端口模式"
-        unset firstport; unset endport
-    fi
+            else yellow "警告: 未找到netfilter-persistent或iptables-save，防火墙规则可能在重启后丢失。"; fi
+        else red "端口跳跃设置无效或已跳过。"; unset firstport; unset endport; fi
+    else red "将继续使用单端口模式"; unset firstport; unset endport; fi
 }
 
 inst_pwd(){
@@ -346,8 +441,31 @@ insthysteria(){
     [[ -z "$ip" ]] && red "错误：无法获取服务器的公网IP地址！ Hysteria安装中止。" && exit 1
     yellow "脚本初步检测到服务器IP为: $ip (后续证书申请流程可能会根据DNS验证更新此IP)"
 
-    if [[ ! "$SYSTEM" == "CentOS" ]]; then ${PACKAGE_UPDATE[int]}; fi
-    ${PACKAGE_INSTALL[int]} curl wget sudo qrencode procps iptables-persistent netfilter-persistent dnsutils coreutils openssl
+    local packages_to_install=("curl" "wget" "sudo" "qrencode" "procps" "iptables-persistent" "netfilter-persistent" "coreutils" "openssl")
+    if [[ "$SYSTEM" == "CentOS" || "$SYSTEM" == "Fedora" || "$SYSTEM" == "Rocky" || "$SYSTEM" == "Alma" ]]; then
+        packages_to_install+=("bind-utils" "cronie") 
+    else
+        packages_to_install+=("dnsutils" "cron") 
+    fi
+    
+    if [[ ! "$SYSTEM" == "CentOS" && ! "$SYSTEM" == "Fedora" && ! "$SYSTEM" == "Rocky" && ! "$SYSTEM" == "Alma" ]]; then ${PACKAGE_UPDATE[int]}; fi
+    for pkg_name_full in "${packages_to_install[@]}"; do
+        local pkg_to_check="$pkg_name_full"
+        # Handle cases like "bind-utils for dig" where we check for the command "dig"
+        if [[ "$pkg_name_full" == "bind-utils" || "$pkg_name_full" == "dnsutils" ]]; then pkg_to_check="dig"; fi
+        if [[ "$pkg_name_full" == "coreutils" ]]; then pkg_to_check="realpath"; fi
+        if [[ "$pkg_name_full" == "cronie" || "$pkg_name_full" == "cron" ]]; then pkg_to_check="crontab"; fi
+        
+        # Skip if tool exists or if package is wrong for OS
+        if [[ -n $(type -P "$pkg_to_check") && "$pkg_to_check" != "crontab" ]]; then continue; fi # crontab is a tool but cron/cronie is the service
+        if [[ "$pkg_name_full" == "dnsutils" && ("$SYSTEM" == "CentOS" || "$SYSTEM" == "Fedora" || "$SYSTEM" == "Rocky" || "$SYSTEM" == "Alma") ]]; then continue; fi
+        if [[ "$pkg_name_full" == "bind-utils" && ! ("$SYSTEM" == "CentOS" || "$SYSTEM" == "Fedora" || "$SYSTEM" == "Rocky" || "$SYSTEM" == "Alma") ]]; then continue; fi
+        if [[ "$pkg_name_full" == "cronie" && ! ("$SYSTEM" == "CentOS" || "$SYSTEM" == "Fedora" || "$SYSTEM" == "Rocky" || "$SYSTEM" == "Alma") ]]; then continue; fi
+        if [[ "$pkg_name_full" == "cron" && ("$SYSTEM" == "CentOS" || "$SYSTEM" == "Fedora" || "$SYSTEM" == "Rocky" || "$SYSTEM" == "Alma") ]]; then continue; fi
+        
+        ${PACKAGE_INSTALL[int]} "$pkg_name_full"
+    done
+
 
     if [[ ! -f "/usr/local/bin/hysteria" ]]; then
         wget -N https://raw.githubusercontent.com/Misaka-blog/hysteria-install/main/hy2/install_server.sh
@@ -366,13 +484,12 @@ insthysteria(){
     [[ -z "$port" ]] && red "内部错误: Port ($port) 未设置。" && exit 1
     [[ -z "$auth_pwd" ]] && red "内部错误: Password ($auth_pwd) 未设置。" && exit 1
     [[ -z "$hy_domain" ]] && red "内部错误: SNI ($hy_domain) 未设置。" && exit 1
-    [[ -z "$cert_path" || -z "$key_path" ]] && red "内部错误: 证书路径未设置。" && exit 1
+    [[ ! -f "$cert_path" || ! -f "$key_path" ]] && red "内部错误: 证书或密钥在 $cert_path / $key_path 未找到。" && exit 1
 
-    mkdir -p /etc/hysteria 
     cat << EOF > /etc/hysteria/config.yaml
 listen: :$port
 tls:
-  cert: $cert_path
+  cert: $cert_path 
   key: $key_path
 quic:
   initStreamReceiveWindow: 16777216
@@ -417,11 +534,8 @@ fastOpen: true
 socks5: {listen: 127.0.0.1:5678}
 transport: {udp: {hopInterval: 30s}}
 EOF
-    # For JSON, boolean false/true should not be quoted
     local json_insecure_val="$client_tls_insecure_bool_value"
-    if [[ "$json_insecure_val" != "true" && "$json_insecure_val" != "false" ]]; then # Should not happen with current logic
-        json_insecure_val="true" # Fallback
-    fi
+    if [[ "$json_insecure_val" != "true" && "$json_insecure_val" != "false" ]]; then json_insecure_val="true"; fi
 
     cat << EOF > /root/hy/hy-client.json
 {
@@ -455,7 +569,7 @@ EOF
     fi
     red "======================================================================================"
     green "Hysteria 2 代理服务安装完成"
-    showconf # Call showconf to display all configs
+    showconf 
     echo ""
     yellow "重要: 如果您使用了端口跳跃，请确保客户端支持该格式的端口定义 (port,start-end)。"
 }
@@ -480,27 +594,25 @@ unsthysteria(){
         systemctl daemon-reload
     fi
 
-    rm -rf /usr/local/bin/hysteria /etc/hysteria /root/hy
+    rm -rf /usr/local/bin/hysteria /etc/hysteria /root/hy 
     
     if grep -q "$HOME/.acme.sh/acme.sh --cron" /etc/crontab || crontab -l 2>/dev/null | grep -q "$HOME/.acme.sh/acme.sh --cron"; then
         green "正在移除acme.sh的cron任务..."
-        (crontab -l 2>/dev/null | grep -v "$HOME/.acme.sh/acme.sh --cron") | crontab -
+        (crontab -l 2>/dev/null | grep -vF "\"$HOME/.acme.sh/acme.sh\" --cron") | crontab -
         if [[ -w /etc/crontab && ("$SYSTEM" == "CentOS" || "$SYSTEM" == "Fedora" || "$SYSTEM" == "Rocky" || "$SYSTEM" == "Alma") ]]; then
-             sed -i "\!$HOME/.acme.sh/acme.sh --cron!d" /etc/crontab
+            local cron_pattern_escaped_for_sed
+            cron_pattern_escaped_for_sed=$(printf '%s\n' "\"$HOME/.acme.sh/acme.sh\" --cron" | sed 's/[\/\.*^$[]/\\&/g')
+            sed -i "/${cron_pattern_escaped_for_sed}/d" /etc/crontab
         fi
     fi
     
-    green "正在移除由本脚本添加的iptables端口跳跃规则 (带注释 ${PORT_JUMP_COMMENT:-hysteria_jump_rule_v2})..."
-    local current_jump_comment="${PORT_JUMP_COMMENT:-hysteria_jump_rule_v2}" # Use defined or default
-    # IPv4 rules
+    green "正在移除由本脚本添加的iptables端口跳跃规则 (带注释 $PORT_JUMP_COMMENT)..."
     while IFS= read -r rule_to_delete_args; do
       [[ -n "$rule_to_delete_args" ]] && iptables -t nat -D ${rule_to_delete_args}
-    done < <(iptables-save -t nat | grep -oP "PREROUTING .* --comment \"$current_jump_comment\"" || true)
-    # IPv6 rules
+    done < <(iptables-save -t nat | grep -oP "PREROUTING .* --comment \"$PORT_JUMP_COMMENT\"" || true)
     while IFS= read -r rule_to_delete_args; do
       [[ -n "$rule_to_delete_args" ]] && ip6tables -t nat -D ${rule_to_delete_args}
-    done < <(ip6tables-save -t nat | grep -oP "PREROUTING .* --comment \"$current_jump_comment\"" || true)
-
+    done < <(ip6tables-save -t nat | grep -oP "PREROUTING .* --comment \"$PORT_JUMP_COMMENT\"" || true)
 
     if command -v netfilter-persistent >/dev/null 2>&1; then
         netfilter-persistent save >/dev/null 2>&1
@@ -561,8 +673,7 @@ update_client_configs_insecure_flag() {
     fi
     if [[ -f /root/hy/hy-client.json ]]; then
         local json_val_to_set="$bool_val"
-        # JSON booleans are not strings
-        if [[ "$json_val_to_set" != "true" && "$json_val_to_set" != "false" ]]; then json_val_to_set="true"; fi # Fallback
+        if [[ "$json_val_to_set" != "true" && "$json_val_to_set" != "false" ]]; then json_val_to_set="true"; fi 
         sed -i "s/\"insecure\": \(true\|false\)/\"insecure\": $json_val_to_set/g" /root/hy/hy-client.json
     fi
     if [[ -f /root/hy/url.txt ]]; then
@@ -574,38 +685,66 @@ change_cert(){
     if [[ ! -f /etc/hysteria/config.yaml ]]; then red "Hysteria 未安装。" && return; fi
     get_systemd_service_name; if [[ -z "$SYSTEMD_SERVICE_NAME" ]]; then red "Hysteria服务名未知!" && return; fi
 
-    local old_cert_path_cfg=$(grep -oP 'cert: \K\S+' /etc/hysteria/config.yaml)
-    local old_key_path_cfg=$(grep -oP 'key: \K\S+' /etc/hysteria/config.yaml)
-    local old_hy_domain_client=$(grep -oP 'sni: \K\S+' /root/hy/hy-client.yaml)
-    local preserved_ip_before_cert_change="$ip"
+    # These paths will be /etc/hysteria/... if script ran correctly before or from a fresh install
+    # If config points elsewhere due to old script version/manual edit, sed will update them to /etc/hysteria/...
+    local old_cert_path_from_config=$(grep -oP 'cert: \K\S+' /etc/hysteria/config.yaml)
+    local old_key_path_from_config=$(grep -oP 'key: \K\S+' /etc/hysteria/config.yaml)
+    local old_hy_domain_client="N/A"
+    [[ -f /root/hy/hy-client.yaml ]] && old_hy_domain_client=$(grep -oP 'sni: \K\S+' /root/hy/hy-client.yaml || echo "N/A")
     
-    inst_cert # This updates global: USE_INSECURE_CLIENT_CONFIG, cert_path, key_path, hy_domain, and potentially $ip
+    local preserved_ip_before_cert_change="$ip" 
+    
+    inst_cert # This updates global: USE_INSECURE_CLIENT_CONFIG, 
+              # sets global cert_path & key_path to /etc/hysteria/...,
+              # hy_domain, and potentially $ip. It also applies new permissions.
 
-    sed -i "s|cert: $old_cert_path_cfg|cert: $cert_path|g" /etc/hysteria/config.yaml
-    sed -i "s|key: $old_key_path_cfg|key: $key_path|g" /etc/hysteria/config.yaml
+    # Update Hysteria server config to point to the new standard paths (/etc/hysteria/...)
+    # $cert_path and $key_path are now the new standard /etc/hysteria/... paths from inst_cert
+    local escaped_old_cert_cfg=$(printf '%s\n' "$old_cert_path_from_config" | sed 's:[][\/.^$*]:\\&:g')
+    local escaped_new_cert_cfg=$(printf '%s\n' "$cert_path" | sed 's:[][\/.^$*]:\\&:g')
+    sed -i "s|cert: $escaped_old_cert_cfg|cert: $escaped_new_cert_cfg|g" /etc/hysteria/config.yaml
+
+    local escaped_old_key_cfg=$(printf '%s\n' "$old_key_path_from_config" | sed 's:[][\/.^$*]:\\&:g')
+    local escaped_new_key_cfg=$(printf '%s\n' "$key_path" | sed 's:[][\/.^$*]:\\&:g')
+    sed -i "s|key: $escaped_old_key_cfg|key: $escaped_new_key_cfg|g" /etc/hysteria/config.yaml
     
     local escaped_old_sni=$(printf '%s\n' "$old_hy_domain_client" | sed 's:[][\/.^$*]:\\&:g')
     local escaped_new_sni=$(printf '%s\n' "$hy_domain" | sed 's:[][\/.^$*]:\\&:g')
-    sed -i "s/sni: $escaped_old_sni/sni: $escaped_new_sni/g" /root/hy/hy-client.yaml
-    sed -i "s/\"sni\": \"$escaped_old_sni\"/\"sni\": \"$escaped_new_sni\"/g" /root/hy/hy-client.json
-    sed -i "s/sni=$escaped_old_sni/sni=$escaped_new_sni/g" /root/hy/url.txt
+    if [[ -f /root/hy/hy-client.yaml ]]; then
+        sed -i "s/sni: $escaped_old_sni/sni: $escaped_new_sni/g" /root/hy/hy-client.yaml
+    fi
+    if [[ -f /root/hy/hy-client.json ]]; then
+        sed -i "s/\"sni\": \"$escaped_old_sni\"/\"sni\": \"$escaped_new_sni\"/g" /root/hy/hy-client.json
+    fi
+    if [[ -f /root/hy/url.txt ]]; then
+        sed -i "s/sni=$escaped_old_sni/sni=$escaped_new_sni/g" /root/hy/url.txt
+    fi
 
     if [[ "$ip" != "$preserved_ip_before_cert_change" && -n "$preserved_ip_before_cert_change" ]]; then
         yellow "服务器IP因ACME验证已更新为: $ip。更新客户端配置中的服务器地址..."
         local old_client_ip_f="$preserved_ip_before_cert_change"; if [[ "$preserved_ip_before_cert_change" == *":"* ]]; then old_client_ip_f="[$preserved_ip_before_cert_change]"; fi
         local new_client_ip_f="$ip"; if [[ "$ip" == *":"* ]]; then new_client_ip_f="[$ip]"; fi
-        sed -i "s|server: $old_client_ip_f:|server: $new_client_ip_f:|g" /root/hy/hy-client.yaml
-        sed -i "s|\"server\": \"$old_client_ip_f:|\"server\": \"$new_client_ip_f:|g" /root/hy/hy-client.json
-        # URL update is more complex; needs to handle @[ip]:port or @ip:port
-        # This is a basic attempt
-        local escaped_old_ip_url="@$(printf '%s\n' "$preserved_ip_before_cert_change" | sed 's:[][\/.^$*]:\\&:g')"
-        if [[ "$preserved_ip_before_cert_change" == *":"* ]]; then escaped_old_ip_url="@\[$(printf '%s\n' "$preserved_ip_before_cert_change" | sed 's:[][\/.^$*]:\\&:g')\]"; fi
-        local escaped_new_ip_url="@$(printf '%s\n' "$ip" | sed 's:[][\/.^$*]:\\&:g')"
-        if [[ "$ip" == *":"* ]]; then escaped_new_ip_url="@\[$(printf '%s\n' "$ip" | sed 's:[][\/.^$*]:\\&:g')\]"; fi
-        sed -i "s|$escaped_old_ip_url|$escaped_new_ip_url|g" /root/hy/url.txt
+        
+        # Escape for sed
+        local esc_old_client_ip_f=$(printf '%s\n' "$old_client_ip_f" | sed 's:[][\/.^$*]:\\&:g')
+        local esc_new_client_ip_f=$(printf '%s\n' "$new_client_ip_f" | sed 's:[][\/.^$*]:\\&:g')
+
+        if [[ -f /root/hy/hy-client.yaml ]]; then
+             sed -i "s|server: $esc_old_client_ip_f:|server: $esc_new_client_ip_f:|g" /root/hy/hy-client.yaml
+        fi
+        if [[ -f /root/hy/hy-client.json ]]; then
+             sed -i "s|\"server\": \"$esc_old_client_ip_f:|\"server\": \"$esc_new_client_ip_f:|g" /root/hy/hy-client.json
+        fi
+       
+        local escaped_old_ip_url_at="@$(printf '%s\n' "$preserved_ip_before_cert_change" | sed 's:[][\/.^$*]:\\&:g')"
+        if [[ "$preserved_ip_before_cert_change" == *":"* ]]; then escaped_old_ip_url_at="@\[$(printf '%s\n' "$preserved_ip_before_cert_change" | sed 's:[][\/.^$*]:\\&:g')\]"; fi
+        local escaped_new_ip_url_at="@$(printf '%s\n' "$ip" | sed 's:[][\/.^$*]:\\&:g')"
+        if [[ "$ip" == *":"* ]]; then escaped_new_ip_url_at="@\[$(printf '%s\n' "$ip" | sed 's:[][\/.^$*]:\\&:g')\]"; fi
+        if [[ -f /root/hy/url.txt ]]; then
+            sed -i "s|$escaped_old_ip_url_at|$escaped_new_ip_url_at|g" /root/hy/url.txt
+        fi
     fi
     
-    # Update insecure flag based on USE_INSECURE_CLIENT_CONFIG set by inst_cert
     local bool_val_change="true"; local int_val_change="1"
     if [[ "$USE_INSECURE_CLIENT_CONFIG" == "false" ]]; then bool_val_change="false"; int_val_change="0"; fi
     update_client_configs_insecure_flag "$bool_val_change" "$int_val_change"
@@ -616,8 +755,7 @@ change_cert(){
     else red "Hysteria 2 服务重启失败。"; fi
 }
 
-
-changeport(){ # Simplified, full client config regeneration might be better
+changeport(){ 
     if [[ ! -f /etc/hysteria/config.yaml ]]; then red "Hysteria 未安装。" && return; fi
     get_systemd_service_name; if [[ -z "$SYSTEMD_SERVICE_NAME" ]]; then red "Hysteria服务名未知!" && return; fi
     
@@ -627,27 +765,31 @@ changeport(){ # Simplified, full client config regeneration might be better
     read -p "当前监听端口: $old_server_port. 新端口[1-65535] (回车随机)：" new_port_input
     local new_port="${new_port_input:-$(shuf -i 2000-65535 -n 1)}"
 
-    # Port conflict check
-    # ... (omitted for brevity, similar to inst_port)
+    if [[ -n $(ss -tunlp | grep -w udp | awk '{print $5}' | sed 's/.*://g' | grep -w "$new_port") && "$new_port" != "$old_server_port" ]]; then
+        red "$new_port 端口已被占用！"; return 1;
+    fi
 
     sed -i "s/listen: :$old_server_port/listen: :$new_port/g" /etc/hysteria/config.yaml
     
-    # Very basic client config update for the primary port. Port jump ranges are not updated here.
     if [[ -z "$ip" ]]; then realip; fi 
     [[ -z "$ip" ]] && red "无法获取IP更新客户端配置。" && return 1
+    
     local client_ip_f="$ip"; if [[ "$ip" == *":"* ]]; then client_ip_f="[$ip]"; fi
+    local esc_client_ip_f=$(printf '%s\n' "$client_ip_f" | sed 's:[][\/.^$*]:\\&:g') # Escaped for sed LHS
 
-    local old_client_server_port_regex=":$old_server_port" # Matches :port
-    local new_client_server_port_regex=":$new_port"
-    # If old port was part of a range "mainport,start-end", this needs more complex sed.
-    # Example: server: [ip]:mainport,start-end or server: ip:mainport
-    sed -i "s/\(server: $client_ip_f\)$old_client_server_port_regex/\1$new_client_server_port_regex/" /root/hy/hy-client.yaml
-    sed -i "s/\(\"server\": \"$client_ip_f\)$old_client_server_port_regex/\1$new_client_server_port_regex/" /root/hy/hy-client.json
-    sed -i "s/\(@$client_ip_f\)$old_client_server_port_regex/\1$new_client_server_port_regex/" /root/hy/url.txt
+    # This updates the main port number. If port jump was active, the range is not dynamically updated here.
+    # Client config main port part
+    sed -i "s/\(server: $esc_client_ip_f\):$old_server_port/\1:$new_port/" /root/hy/hy-client.yaml
+    sed -i "s/\(\"server\": \"$esc_client_ip_f\):$old_server_port/\1:$new_port/" /root/hy/hy-client.json
+    
+    # URL main port part
+    local esc_at_client_ip_f="@$esc_client_ip_f"
+    sed -i "s/\($esc_at_client_ip_f\):$old_server_port/\1:$new_port/" /root/hy/url.txt
+
 
     systemctl restart "$SYSTEMD_SERVICE_NAME"
     if [[ -n $(systemctl status "$SYSTEMD_SERVICE_NAME" 2>/dev/null | grep -w active) ]]; then
-        green "Hysteria 2 监听端口已修改为：$new_port"; yellow "客户端配置中的主端口已尝试更新。端口跳跃范围需手动检查。"
+        green "Hysteria 2 监听端口已修改为：$new_port"; yellow "客户端配置中的主端口已尝试更新。端口跳跃范围需手动检查/重新配置。"
         showconf
     else red "Hysteria 2 服务重启失败。"; fi
 }
@@ -666,16 +808,15 @@ changepasswd(){
     sed -i "s/auth: $oldpasswd/auth: $new_passwd/g" /root/hy/hy-client.yaml
     sed -i "s/\"auth\": \"$oldpasswd\"/\"auth\": \"$new_passwd\"/g" /root/hy/hy-client.json
     
-    local escaped_old_auth="hysteria2:\/\/$(printf '%s\n' "$oldpasswd" | sed 's:[][\/.^$*]:\\&:g')@"
-    local new_auth="hysteria2://$new_passwd@" # $new_passwd from md5sum is safe
-    sed -i "s#$escaped_old_auth#$new_auth#g" /root/hy/url.txt
+    local escaped_old_auth_url="hysteria2:\/\/$(printf '%s\n' "$oldpasswd" | sed 's:[][\/.^$*]:\\&:g')@"
+    local new_auth_url="hysteria2://$new_passwd@" 
+    sed -i "s#$escaped_old_auth_url#$new_auth_url#g" /root/hy/url.txt
 
     systemctl restart "$SYSTEMD_SERVICE_NAME"
     if [[ -n $(systemctl status "$SYSTEMD_SERVICE_NAME" 2>/dev/null | grep -w active) ]]; then
         green "Hysteria 2 密码已修改为：$new_passwd"; showconf
     else red "Hysteria 2 服务重启失败。"; fi
 }
-
 
 changeproxysite(){
     if [[ ! -f /etc/hysteria/config.yaml ]]; then red "Hysteria 未安装。" && return; fi
@@ -718,10 +859,16 @@ showconf(){
     echo ""; green "--- Hysteria 2 服务器配置 (/etc/hysteria/config.yaml) (服务: ${SYSTEMD_SERVICE_NAME:-未知}) ---"
     cat /etc/hysteria/config.yaml
     echo ""; green "--------------------------------------------------------------------"
-    echo ""; yellow "客户端 YAML (/root/hy/hy-client.yaml):"; cat /root/hy/hy-client.yaml
-    echo ""; yellow "客户端 JSON (/root/hy/hy-client.json):"; cat /root/hy/hy-client.json
-    echo ""; yellow "分享链接 (/root/hy/url.txt):"; local current_url=$(cat /root/hy/url.txt); echo "$current_url"
-    echo ""; yellow "二维码分享链接:"; qrencode -t ANSIUTF8 "$current_url"
+    if [[ -f /root/hy/hy-client.yaml ]]; then
+        echo ""; yellow "客户端 YAML (/root/hy/hy-client.yaml):"; cat /root/hy/hy-client.yaml
+    fi
+    if [[ -f /root/hy/hy-client.json ]]; then
+        echo ""; yellow "客户端 JSON (/root/hy/hy-client.json):"; cat /root/hy/hy-client.json
+    fi
+    if [[ -f /root/hy/url.txt ]]; then
+        echo ""; yellow "分享链接 (/root/hy/url.txt):"; local current_url=$(cat /root/hy/url.txt); echo "$current_url"
+        echo ""; yellow "二维码分享链接:"; qrencode -t ANSIUTF8 "$current_url"
+    fi
 }
 
 menu() {
@@ -738,20 +885,26 @@ menu() {
     
     get_systemd_service_name
     if [[ -f "/etc/hysteria/config.yaml" && -n "$SYSTEMD_SERVICE_NAME" ]]; then
-        local current_status=$(systemctl is-active "$SYSTEMD_SERVICE_NAME")
-        [[ "$current_status" == "active" ]] && green "Hysteria 2 状态: $current_status (运行中)" || yellow "Hysteria 2 状态: $current_status"
+        local current_status=$(systemctl is-active "$SYSTEMD_SERVICE_NAME" 2>/dev/null) # Suppress error if service not found
+        if [[ "$current_status" == "active" ]]; then green "Hysteria 2 状态: $current_status (运行中)"
+        elif [[ "$current_status" == "inactive" || "$current_status" == "failed" ]]; then yellow "Hysteria 2 状态: $current_status"
+        else yellow "Hysteria 2 状态: 未知 (systemctl is-active 返回 '$current_status')"; fi
+        
         local cp=$(grep -oP 'listen: : *\K[0-9]+' /etc/hysteria/config.yaml 2>/dev/null)
-        local cs=$(grep -oP 'sni: \K\S+' /root/hy/hy-client.yaml 2>/dev/null || echo N/A)
+        local cs="N/A"
+        [[ -f /root/hy/hy-client.yaml ]] && cs=$(grep -oP 'sni: \K\S+' /root/hy/hy-client.yaml 2>/dev/null || echo N/A)
         yellow "监听端口: ${cp:-N/A}, SNI: ${cs:-N/A}"
     elif [[ -f "/etc/hysteria/config.yaml" ]]; then yellow "Hysteria配置文件存在但服务名未知。"; else yellow "Hysteria 2 似乎未安装。"; fi
     echo ""
     read -rp "请输入选项 [0-5]: " menuInput
     case $menuInput in
         1) insthysteria ;; 2) unsthysteria ;; 3) hysteriaswitch ;; 4) changeconf ;;
-        5) showconf ;; 0) exit 0 ;; *) red "无效输入!" && sleep 1 ;;
+        5) showconf ;; 0) echo "退出脚本。" && exit 0 ;; *) red "无效输入!" && sleep 1 ;;
     esac
     [[ "$menuInput" != "0" ]] && read -n 1 -s -r -p "按任意键返回主菜单..." && menu
 }
 
 # --- Main execution ---
 menu
+
+```
