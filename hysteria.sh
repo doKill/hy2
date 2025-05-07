@@ -72,21 +72,34 @@ inst_cert(){
     echo -e " ${GREEN}3.${PLAIN} 自定义证书路径"
     echo ""
     read -rp "请输入选项 [1-3]: " certInput
-    if [[ $certInput == 2 ]]; then
+
+    # $ip (全局变量) 应该在调用 inst_cert 之前由 insthysteria 中的 realip 设置好。
+    # ACME流程会根据DNS验证结果重新确认并可能更新这个全局 $ip。
+    # 其他流程 (自定义/自签/已有证书) 会依赖这个由 realip 初始化的 $ip。
+
+    if [[ $certInput == 2 ]]; then # Acme 脚本自动申请
+        # 这些路径用于 acme.sh 安装证书
         cert_path="/root/cert.crt"
         key_path="/root/private.key"
+        local ca_log_path="$HOME/ca.log" # acme.sh 成功申请的域名记录
 
-        chmod a+x /root # 让 Hysteria 主程序访问到 /root 目录
+        # Hysteria 可能以非root用户运行（如果使用setcap），但证书目录通常需要root权限写入
+        # /root 目录通常只有root可写。如果Hysteria配置为其他用户，需调整。
+        # 此脚本设计为root用户运行。
+        chmod a+x "$HOME" # 确保acme.sh可以访问 $HOME/.acme.sh (通常是 /root/.acme.sh)
 
-        if [[ -f /root/cert.crt && -f /root/private.key ]] && [[ -s /root/cert.crt && -s /root/private.key ]] && [[ -f /root/ca.log ]]; then
-            domain=$(cat /root/ca.log)
-            green "检测到原有域名：$domain 的证书，正在应用"
-            hy_domain=$domain
-            # 如果已有证书，确保全局 $ip 已被 insthysteria 中的 realip 设置
-            # (insthysteria 总是在 inst_cert 之前调用 realip)
-            [[ -z "$ip" ]] && red "错误: 无法获取服务器IP。请检查realip函数或网络连接。" && exit 1
-
+        if [[ -f "$cert_path" && -f "$key_path" ]] && [[ -s "$cert_path" && -s "$key_path" ]] && [[ -f "$ca_log_path" ]]; then
+            domain=$(cat "$ca_log_path")
+            green "检测到原有域名 '$domain' 的ACME证书 ($cert_path, $key_path)，将直接应用。"
+            hy_domain="$domain"
+            # 确保 $ip 已设置 (应由 insthysteria 中的 realip 完成)
+            if [[ -z "$ip" ]]; then
+                red "错误: 服务器IP未设置 (全局 \$ip 为空)。无法继续。"
+                exit 1
+            fi
+            yellow "将使用服务器IP: $ip 和SNI: $hy_domain 生成客户端配置。"
         else
+            green "准备为新域名申请ACME证书..."
             # --- 开始新的IP和DNS检测逻辑 ---
             WARPv4Status=$(curl -s4m8 https://www.cloudflare.com/cdn-cgi/trace -k | grep warp | cut -d= -f2)
             WARPv6Status=$(curl -s6m8 https://www.cloudflare.com/cdn-cgi/trace -k | grep warp | cut -d= -f2)
@@ -98,14 +111,12 @@ inst_cert(){
                 green "检测到WARP已激活，临时停用WARP以获取真实IP..."
                 wg-quick down wgcf >/dev/null 2>&1
                 systemctl stop warp-go >/dev/null 2>&1
-                # 短暂等待网络恢复
-                sleep 3 
+                sleep 3 # 短暂等待网络状态稳定
                 temp_server_ipv4=$(curl -s4m8 ip.sb -k)
                 temp_server_ipv6=$(curl -s6m8 ip.sb -k)
-                green "重新激活WARP (如果之前是开启状态)..."
-                # 仅在之前是on/plus时才启动
-                if [[ $WARPv4Status =~ on|plus ]] || [[ $WARPv6Status =~ on|plus ]]; then
-                    wg-quick up wgcf >/dev/null 2>&1 
+                green "尝试重新激活WARP (如果之前是开启状态)..."
+                if [[ $WARPv4Status =~ on|plus ]] || [[ $WARPv6Status =~ on|plus ]]; then # 仅当之前确实开启时才启动
+                    wg-quick up wgcf >/dev/null 2>&1
                     systemctl start warp-go >/dev/null 2>&1
                 fi
             else
@@ -122,27 +133,25 @@ inst_cert(){
             [[ -n "$temp_server_ipv4" ]] && yellow "  IPv4: $temp_server_ipv4"
             [[ -n "$temp_server_ipv6" ]] && yellow "  IPv6: $temp_server_ipv6"
 
-            read -p "请输入需要申请证书的域名：" domain
-            [[ -z $domain ]] && red "未输入域名，无法执行操作！" && exit 1
+            read -p "请输入需要申请证书的域名：" domain_input_for_acme # 使用局部变量以避免与全局domain冲突
+            [[ -z "$domain_input_for_acme" ]] && red "未输入域名，无法执行操作！" && exit 1
+            domain="$domain_input_for_acme" # 更新全局 domain 变量
             green "已输入的域名：$domain" && sleep 1
 
             yellow "正在解析域名 '$domain' 的DNS记录..."
             local domain_a_record_ip=$(dig A +short "$domain" | head -n1)
             local domain_aaaa_record_ip=$(dig AAAA +short "$domain" | head -n1)
 
-            # 'ip' 变量将根据成功的DNS验证来设置 (会影响全局 $ip)
-            # 'is_ipv6_validation_for_acme' 将用于acme.sh命令 (局部变量)
-            local is_ipv6_validation_for_acme=false 
-            
-            # 优先尝试匹配A记录 (如果服务器有IPv4)
+            local is_ipv6_validation_for_acme=false # 局部变量，用于决定acme.sh是否用 --listen-v6
+            # 全局 $ip 将被更新为通过验证的那个IP地址
+
             if [[ -n "$temp_server_ipv4" && -n "$domain_a_record_ip" && "$domain_a_record_ip" == "$temp_server_ipv4" ]]; then
-                ip="$temp_server_ipv4" # 设置全局ip变量
+                ip="$temp_server_ipv4" # 更新全局ip
                 is_ipv6_validation_for_acme=false
                 green "验证成功: 域名 '$domain' 的 A 记录 ($domain_a_record_ip) 正确指向服务器 IPv4 ($ip)."
                 yellow "将使用 IPv4 ($ip) 进行ACME证书申请。"
-            # 否则，尝试匹配AAAA记录 (如果服务器有IPv6)
             elif [[ -n "$temp_server_ipv6" && -n "$domain_aaaa_record_ip" && "$domain_aaaa_record_ip" == "$temp_server_ipv6" ]]; then
-                ip="$temp_server_ipv6" # 设置全局ip变量
+                ip="$temp_server_ipv6" # 更新全局ip
                 is_ipv6_validation_for_acme=true
                 green "验证成功: 域名 '$domain' 的 AAAA 记录 ($domain_aaaa_record_ip) 正确指向服务器 IPv6 ($ip)."
                 yellow "将使用 IPv6 ($ip) 进行ACME证书申请。"
@@ -157,12 +166,9 @@ inst_cert(){
                 exit 1
             fi
             
-            # 此时, 全局 'ip' 已被设置为通过验证的那个IP (v4或v6)
-            # 'is_ipv6_validation_for_acme' (局部变量) 指示这个 'ip' 是否为IPv6
-
             # Install necessary packages for acme.sh
-            ${PACKAGE_INSTALL[int]} curl wget sudo socat openssl dnsutils # dnsutils for dig
-            if [[ $SYSTEM == "CentOS" ]]; then
+            ${PACKAGE_INSTALL[int]} curl wget sudo socat openssl dnsutils 
+            if [[ "$SYSTEM" == "CentOS" ]]; then # Use direct comparison for SYSTEM
                 ${PACKAGE_INSTALL[int]} cronie
                 systemctl start crond
                 systemctl enable crond
@@ -172,77 +178,146 @@ inst_cert(){
                 systemctl enable cron
             fi
             
-            # Install or update acme.sh
-            if ! command -v ~/.acme.sh/acme.sh &>/dev/null; then
-                curl https://get.acme.sh | sh -s email=$(date +%s%N | md5sum | cut -c 1-16)@gmail.com
-                source ~/.bashrc # Reload bashrc to ensure acme.sh command is available
-            fi
-            ~/.acme.sh/acme.sh --upgrade --auto-upgrade
-            ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt
+            # --- 开始健壮的 acme.sh 处理部分 ---
+            local ACME_SH_PATH="$HOME/.acme.sh/acme.sh"
 
-            # Issue certificate
+            if [[ ! -f "$ACME_SH_PATH" ]]; then
+                yellow "$ACME_SH_PATH 未找到。正在尝试安装 acme.sh..."
+                mkdir -p "$HOME/.acme.sh" 
+                if curl https://get.acme.sh | sh -s email=$(date +%s%N | md5sum | cut -c 1-16)@gmail.com; then
+                    green "acme.sh 安装成功。"
+                else
+                    red "acme.sh 安装失败。请检查输出。"
+                    exit 1
+                fi
+                if [[ -f "$HOME/.bashrc" ]]; then
+                    source "$HOME/.bashrc"
+                fi
+            else
+                green "acme.sh 已找到于 $ACME_SH_PATH."
+            fi
+
+            if [[ ! -f "$ACME_SH_PATH" ]]; then
+                red "严重错误: $ACME_SH_PATH 文件不存在，即使在尝试安装后。"
+                exit 1
+            fi
+            if [[ ! -x "$ACME_SH_PATH" ]]; then
+                yellow "警告: $ACME_SH_PATH 不可执行。正在尝试添加执行权限 (chmod +x)..."
+                chmod +x "$ACME_SH_PATH"
+                if [[ ! -x "$ACME_SH_PATH" ]]; then
+                    red "严重错误: 未能使 $ACME_SH_PATH 可执行。"
+                    exit 1
+                fi
+            fi
+
+            green "正在尝试升级 acme.sh..."
+            if ! "$ACME_SH_PATH" --upgrade --auto-upgrade; then
+                yellow "警告: acme.sh 升级命令执行失败或存在问题。脚本将继续尝试..."
+            fi
+
+            green "正在为 acme.sh 设置默认 CA..."
+            if ! "$ACME_SH_PATH" --set-default-ca --server letsencrypt; then
+                red "错误: 为 acme.sh 设置默认 CA 失败。这可能导致后续步骤失败。"
+                # exit 1 # 可以考虑设为致命错误
+            fi
+
             green "正在为域名 '$domain' 申请证书 (使用 ${ip} 进行验证)..."
-            local acme_cmd_base="~/.acme.sh/acme.sh --issue -d ${domain} --standalone -k ec-256 --insecure"
-            if $is_ipv6_validation_for_acme; then # 如果我们验证的是IPv6
-                bash $acme_cmd_base --listen-v6
-            else # 否则验证的是IPv4
-                bash $acme_cmd_base
+            local issue_cmd_status
+            if $is_ipv6_validation_for_acme; then
+                "$ACME_SH_PATH" --issue -d "${domain}" --standalone -k ec-256 --insecure --listen-v6
+                issue_cmd_status=$?
+            else
+                "$ACME_SH_PATH" --issue -d "${domain}" --standalone -k ec-256 --insecure
+                issue_cmd_status=$?
             fi
             
-            # Install certificate
-            if ~/.acme.sh/acme.sh --install-cert -d ${domain} --key-file "$key_path" --fullchain-file "$cert_path" --ecc; then
+            if [[ $issue_cmd_status -ne 0 ]]; then
+                red "错误: acme.sh 证书签发命令 (--issue) 失败，错误码: $issue_cmd_status 。"
+                red "请检查上述 acme.sh 的输出日志以获取详细错误信息。"
+                exit 1
+            fi
+            green "证书签发命令已为 '$domain' 执行完毕。"
+
+            green "正在尝试安装 '$domain' 的证书..."
+            if "$ACME_SH_PATH" --install-cert -d "${domain}" --key-file "$key_path" --fullchain-file "$cert_path" --ecc; then
                 if [[ -f "$cert_path" && -f "$key_path" ]] && [[ -s "$cert_path" && -s "$key_path" ]]; then
-                    echo "$domain" > /root/ca.log
-                    # Remove old cron job if any, then add new one
-                    sed -i '\!/root/\.acme\.sh/acme\.sh --cron!d' /etc/crontab >/dev/null 2>&1 
-                    echo "0 0 * * * root bash /root/.acme.sh/acme.sh --cron -f >/dev/null 2>&1" >> /etc/crontab
-                    green "证书申请成功! 脚本申请到的证书 (cert.crt) 和私钥 (private.key) 文件已保存到 /root 文件夹下"
-                    yellow "证书crt文件路径如下: $cert_path"
-                    yellow "私钥key文件路径如下: $key_path"
-                    hy_domain="$domain"
+                    echo "$domain" > "$ca_log_path"
+                    
+                    (crontab -l 2>/dev/null | grep -v "$ACME_SH_PATH --cron" ; echo "0 0 * * * \"$ACME_SH_PATH\" --cron -f >/dev/null 2>&1") | crontab -
+                    if [[ $? -ne 0 && -w /etc/crontab && "$SYSTEM" == "CentOS" ]]; then # CentOS often uses /etc/crontab for root
+                        sed -i "\!\"$ACME_SH_PATH\" --cron!d" /etc/crontab 
+                        echo "0 0 * * * root \"$ACME_SH_PATH\" --cron -f >/dev/null 2>&1" >> /etc/crontab
+                    fi
+
+                    if crontab -l 2>/dev/null | grep -q "$ACME_SH_PATH --cron" || grep -q "$ACME_SH_PATH --cron" /etc/crontab 2>/dev/null ; then
+                         green "acme.sh 证书自动续签的cron任务已设置。"
+                    else
+                         yellow "警告: 未能自动设置acme.sh的cron续签任务。您可能需要手动设置。"
+                    fi
+
+                    green "证书申请与安装成功!"
+                    yellow "证书crt文件路径: $cert_path"
+                    yellow "私钥key文件路径: $key_path"
+                    hy_domain="$domain" # 更新全局的SNI域名
                 else
-                    red "错误：证书文件未成功生成或为空，请检查acme.sh的输出。"
+                    red "错误：证书文件 ($cert_path, $key_path) 未能生成或为空，即使 '--install-cert' 命令报告成功。"
                     exit 1
                 fi
             else
-                red "错误：acme.sh 证书安装步骤失败。请检查acme.sh的输出。"
+                red "错误：acme.sh 证书安装步骤 (--install-cert) 失败。"
+                yellow "这通常意味着之前的 '--issue' 步骤未能成功获取证书。"
+                yellow "请检查上述 acme.sh 的输出日志以获取详细信息。"
                 exit 1
             fi
+            # --- 结束健壮的 acme.sh 处理部分 ---
         fi
-    elif [[ $certInput == 3 ]]; then
-        read -p "请输入公钥文件 crt 的路径：" cert_path_input
-        cert_path=$(realpath "$cert_path_input") # Get absolute path
-        yellow "公钥文件 crt 的路径：$cert_path "
-        read -p "请输入密钥文件 key 的路径：" key_path_input
-        key_path=$(realpath "$key_path_input") # Get absolute path
-        yellow "密钥文件 key 的路径：$key_path "
-
-        if [[ ! -f "$cert_path" || ! -f "$key_path" ]]; then
-            red "错误: 提供的证书或密钥文件路径无效。"
+    elif [[ $certInput == 3 ]]; then # 自定义证书路径
+        read -p "请输入公钥文件 crt 的绝对路径：" cert_path_input
+        # 使用 realpath (需要 coreutils 包) 获取规范的绝对路径
+        if ! cert_path=$(realpath -e "$cert_path_input" 2>/dev/null); then # -e checks existence
+            red "错误: 公钥文件路径 '$cert_path_input' 无效或文件不存在。"
             exit 1
         fi
-        
-        read -p "请输入证书的域名 (用于SNI)：" domain_input # 这个domain将成为hy_domain (SNI)
-        [[ -z "$domain_input" ]] && red "域名不能为空!" && exit 1
-        domain="$domain_input" # for consistency if needed elsewhere
-        hy_domain="$domain_input"
-        yellow "证书SNI域名：$hy_domain"
-        
-        # 对于自定义证书，确保全局 $ip 已被 insthysteria 中的 realip 设置
-        [[ -z "$ip" ]] && red "错误: 无法获取服务器IP以生成客户端配置。请检查realip函数或网络连接。" && exit 1
+        yellow "公钥文件 crt 的路径已确认为：$cert_path"
 
-    else # 默认使用自签证书
+        read -p "请输入密钥文件 key 的绝对路径：" key_path_input
+        if ! key_path=$(realpath -e "$key_path_input" 2>/dev/null); then
+            red "错误: 密钥文件路径 '$key_path_input' 无效或文件不存在。"
+            exit 1
+        fi
+        yellow "密钥文件 key 的路径已确认为：$key_path"
+        
+        read -p "请输入证书对应的域名 (将用作SNI)：" domain_input_custom
+        [[ -z "$domain_input_custom" ]] && red "SNI域名不能为空!" && exit 1
+        domain="$domain_input_custom" # 更新全局 domain (主要用于日志或一致性)
+        hy_domain="$domain_input_custom" # 更新全局 SNI
+        yellow "证书SNI域名将使用：$hy_domain"
+        
+        # 确保 $ip 已设置 (应由 insthysteria 中的 realip 完成)
+        if [[ -z "$ip" ]]; then
+            red "错误: 服务器IP未设置 (全局 \$ip 为空)。无法继续。"
+            exit 1
+        fi
+        yellow "将使用服务器IP: $ip 和SNI: $hy_domain 生成客户端配置。"
+
+    else # 默认使用自签证书 (certInput is 1 or default)
         green "将使用必应自签证书作为 Hysteria 2 的节点证书"
-        mkdir -p /etc/hysteria # Ensure directory exists
+        mkdir -p /etc/hysteria 
         cert_path="/etc/hysteria/cert.crt"
         key_path="/etc/hysteria/private.key"
         openssl ecparam -genkey -name prime256v1 -out "$key_path"
         openssl req -new -x509 -days 36500 -key "$key_path" -out "$cert_path" -subj "/CN=www.bing.com"
-        hy_domain="www.bing.com" # SNI
-        domain="www.bing.com"    # 只是一个占位符域名
         
-        # 对于自签证书，确保全局 $ip 已被 insthysteria 中的 realip 设置
-        [[ -z "$ip" ]] && red "错误: 无法获取服务器IP以生成客户端配置。请检查realip函数或网络连接。" && exit 1
+        domain="www.bing.com"    # 用于日志或一致性
+        hy_domain="www.bing.com" # SNI
+        yellow "自签证书SNI将使用：$hy_domain"
+
+        # 确保 $ip 已设置 (应由 insthysteria 中的 realip 完成)
+        if [[ -z "$ip" ]]; then
+            red "错误: 服务器IP未设置 (全局 \$ip 为空)。无法继续。"
+            exit 1
+        fi
+        yellow "将使用服务器IP: $ip 和SNI: $hy_domain 生成客户端配置。"
     fi
 }
 
