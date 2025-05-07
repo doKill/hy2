@@ -41,6 +41,7 @@ proxysite=""
 SYSTEMD_SERVICE_NAME=""
 USE_INSECURE_CLIENT_CONFIG="true"
 PORT_JUMP_COMMENT="hysteria_jump_rule_v2"
+PACKAGE_UPDATE_RUN_ONCE_FLAG="" # Flag to ensure apt update runs only once if needed
 
 [[ $EUID -ne 0 ]] && red "注意: 请在root用户下运行脚本" && exit 1
 
@@ -57,16 +58,36 @@ done
 [[ -z $SYSTEM ]] && red "目前暂不支持你的VPS的操作系统！" && exit 1
 
 ensure_tool() {
-    local tool_name="$1"
-    local package_name="$2"
-    if [[ -z $(type -P "$tool_name") ]]; then
-        yellow "$tool_name 未安装，正在尝试安装 $package_name..."
-        # Avoid redundant updates on yum systems unless absolutely necessary
-        if [[ ! "$SYSTEM" == "CentOS" && ! "$SYSTEM" == "Fedora" && ! "$SYSTEM" == "Rocky" && ! "$SYSTEM" == "Alma" ]]; then ${PACKAGE_UPDATE[int]}; fi
-        ${PACKAGE_INSTALL[int]} "$package_name" || (red "$tool_name ($package_name) 安装失败，请手动安装后再运行脚本。" && exit 1)
-        # Verify again after install attempt
-        if [[ -z $(type -P "$tool_name") ]]; then red "$tool_name 安装后仍未找到 (尝试从包 $package_name 安装)。请检查安装。" && exit 1; fi
-        green "$tool_name (来自包 $package_name) 安装成功。"
+    local tool_cmd_to_check="$1" # This is the command we expect to find in PATH
+    local package_to_install="$2"  # This is the package that provides the command
+
+    if type -P "$tool_cmd_to_check" >/dev/null 2>&1; then
+        # green "$tool_cmd_to_check 已安装。" # Optional: for debugging
+        return 0 # Tool already found
+    fi
+
+    # Specific check for netfilter-persistent if type -P fails (common on Debian/Ubuntu)
+    if [[ "$tool_cmd_to_check" == "netfilter-persistent" && -x "/usr/sbin/netfilter-persistent" ]]; then
+        # green "$tool_cmd_to_check (在 /usr/sbin/netfilter-persistent 找到) 已存在。"
+        return 0
+    fi
+
+    yellow "$tool_cmd_to_check 未找到，正在尝试安装包 $package_to_install..."
+    if [[ ! "$SYSTEM" == "CentOS" && ! "$SYSTEM" == "Fedora" && ! "$SYSTEM" == "Rocky" && ! "$SYSTEM" == "Alma" ]]; then
+         if [[ -z "$PACKAGE_UPDATE_RUN_ONCE_FLAG" ]]; then
+            ${PACKAGE_UPDATE[int]}
+            export PACKAGE_UPDATE_RUN_ONCE_FLAG="true" # Set flag after first run
+         fi
+    fi
+    ${PACKAGE_INSTALL[int]} "$package_to_install"
+
+    # Re-check after install attempt
+    if type -P "$tool_cmd_to_check" >/dev/null 2>&1; then
+        green "$tool_cmd_to_check (来自包 $package_to_install) 安装成功。"
+    elif [[ "$tool_cmd_to_check" == "netfilter-persistent" && -x "/usr/sbin/netfilter-persistent" ]]; then
+        green "$tool_cmd_to_check (在 /usr/sbin/netfilter-persistent 找到) 安装/验证成功。"
+    else
+        red "$tool_cmd_to_check (尝试从包 $package_to_install 安装) 后仍未找到。请检查安装。" && exit 1
     fi
 }
 
@@ -79,13 +100,9 @@ else
 fi
 ensure_tool "realpath" "coreutils"
 ensure_tool "openssl" "openssl"
+ensure_tool "iptables" "iptables" # This should bring iptables-save etc.
 # ensure_tool "qrencode" "qrencode" # Removed qrencode
-ensure_tool "crontab" "cron" # Package name varies, cron/cronie, ensure_tool in insthysteria handles OS specific
-ensure_tool "iptables" "iptables"
-ensure_tool "ip6tables" "iptables" # Often part of the same iptables package
-ensure_tool "iptables-save" "iptables"
-ensure_tool "ip6tables-save" "iptables"
-# For netfilter-persistent, package is often iptables-persistent
+
 if [[ "$SYSTEM" == "Debian" || "$SYSTEM" == "Ubuntu" ]]; then
     ensure_tool "netfilter-persistent" "iptables-persistent"
 fi
@@ -195,7 +212,8 @@ inst_cert(){
                  acme_deps+=("cron")
             fi
             for dep_pkg in "${acme_deps[@]}"; do
-                 ${PACKAGE_INSTALL[int]} "$dep_pkg" # ensure_tool would be better but this is simpler here
+                 # ensure_tool could be used here too, but direct install is fine as these are specific to ACME path
+                 ${PACKAGE_INSTALL[int]} "$dep_pkg"
             done
             local cron_daemon_to_manage="cron"
             if [[ "$SYSTEM" == "CentOS" || "$SYSTEM" == "Fedora" || "$SYSTEM" == "Rocky" || "$SYSTEM" == "Alma" ]]; then
@@ -229,23 +247,19 @@ inst_cert(){
 
                     green "正在尝试设置acme.sh证书自动续签的cron任务..."
                     local cron_service_active=false
-                    local cron_daemon_name="cron"
-                    if [[ "$SYSTEM" == "CentOS" || "$SYSTEM" == "Fedora" || "$SYSTEM" == "Rocky" || "$SYSTEM" == "Alma" ]]; then
-                        cron_daemon_name="crond"
-                    fi
-
-                    if systemctl is-active --quiet "$cron_daemon_name"; then
-                        green "Cron服务 ($cron_daemon_name) 正在运行。"
+                    # cron_daemon_name already set above based on SYSTEM
+                    if systemctl is-active --quiet "$cron_daemon_to_manage"; then # Use a consistent variable
+                        green "Cron服务 ($cron_daemon_to_manage) 正在运行。"
                         cron_service_active=true
                     else
-                        yellow "警告: Cron服务 ($cron_daemon_name) 当前未运行。正在尝试启动..."
-                        systemctl start "$cron_daemon_name"
+                        yellow "警告: Cron服务 ($cron_daemon_to_manage) 当前未运行。正在尝试启动..."
+                        systemctl start "$cron_daemon_to_manage"
                         sleep 2
-                        if systemctl is-active --quiet "$cron_daemon_name"; then
-                            green "Cron服务 ($cron_daemon_name) 已成功启动。"
+                        if systemctl is-active --quiet "$cron_daemon_to_manage"; then
+                            green "Cron服务 ($cron_daemon_to_manage) 已成功启动。"
                             cron_service_active=true
                         else
-                            red "错误: 无法启动Cron服务 ($cron_daemon_name)。自动续签将无法工作。"
+                            red "错误: 无法启动Cron服务 ($cron_daemon_to_manage)。自动续签将无法工作。"
                         fi
                     fi
 
@@ -413,32 +427,21 @@ insthysteria(){
     [[ -z "$ip" ]] && red "错误：无法获取服务器的公网IP地址！ Hysteria安装中止。" && exit 1
     yellow "脚本初步检测到服务器IP为: $ip (后续证书申请流程可能会根据DNS验证更新此IP)"
 
-    local packages_to_install_hysteria=("sudo" "procps" "iptables-persistent")
-
+    # Packages needed for Hysteria setup, excluding those handled by initial ensure_tool or ACME-specific logic
+    local essential_setup_pkgs=("sudo" "procps") # procps for 'ss'
+    
     if [[ "$SYSTEM" == "CentOS" || "$SYSTEM" == "Fedora" || "$SYSTEM" == "Rocky" || "$SYSTEM" == "Alma" ]]; then
-        packages_to_install_hysteria+=("cronie")
+        ensure_tool "crontab" "cronie" # Ensure cronie and thus crontab command
     else
-        packages_to_install_hysteria+=("cron")
+        ensure_tool "crontab" "cron"   # Ensure cron and thus crontab command
     fi
+    ensure_tool "ss" "procps" # Specifically check for ss from procps
 
-    if [[ ! "$SYSTEM" == "CentOS" && ! "$SYSTEM" == "Fedora" && ! "$SYSTEM" == "Rocky" && ! "$SYSTEM" == "Alma" ]]; then 
-      # Run update once for apt systems if any package will be installed by ensure_tool below or specific acme_deps
-      # This is a heuristic, as ensure_tool for fundamental tools might have already run it.
-      # ${PACKAGE_UPDATE[int]}
-      : # Assuming ensure_tool calls at global scope handled initial update if needed
-    fi
-    for pkg_name_full in "${packages_to_install_hysteria[@]}"; do
-        local pkg_to_check="$pkg_name_full"
-        local package_name_for_os="$pkg_name_full"
-        case "$pkg_name_full" in
-             "procps") pkg_to_check="ss" ;; # Check for 'ss' command for 'procps' package
-             "cronie") pkg_to_check="crontab" ;;
-             "cron") pkg_to_check="crontab" ;;
-             "iptables-persistent") package_name_for_os="iptables-persistent" ;;
-             *) ;;
-        esac
-        ensure_tool "$pkg_to_check" "$package_name_for_os"
+    for pkg_name_full in "${essential_setup_pkgs[@]}"; do
+        if [[ "$pkg_name_full" == "procps" ]]; then continue; fi # Already handled by ensure_tool "ss" "procps"
+        ensure_tool "$pkg_name_full" "$pkg_name_full" # Assume tool name is package name
     done
+
 
     if [[ ! -f "/usr/local/bin/hysteria" ]]; then
         wget -N https://raw.githubusercontent.com/Misaka-blog/hysteria-install/main/hy2/install_server.sh
@@ -665,9 +668,8 @@ change_cert(){
 
     local preserved_ip_before_cert_change="$ip"
 
-    inst_cert # This updates global vars and sets permissions. $cert_path, $key_path point to /etc/hysteria/...
+    inst_cert # Updates globals: USE_INSECURE_CLIENT_CONFIG, cert_path, key_path, hy_domain, maybe ip. Sets perms.
 
-    # Ensure Hysteria config points to /etc/hysteria/...
     local std_cert_path="/etc/hysteria/cert.crt"; local std_key_path="/etc/hysteria/private.key"
     local esc_std_cert_path=$(printf '%s\n' "$std_cert_path" | sed 's:[][\/.^$*]:\\&:g')
     local esc_std_key_path=$(printf '%s\n' "$std_key_path" | sed 's:[][\/.^$*]:\\&:g')
@@ -690,7 +692,7 @@ change_cert(){
         local esc_new_client_ip_f=$(printf '%s\n' "$new_client_ip_f" | sed 's:[][\/.^$*]:\\&:g')
         if [[ -f /root/hy/hy-client.yaml ]]; then sed -i "s|server: $esc_old_client_ip_f:|server: $esc_new_client_ip_f:|g" /root/hy/hy-client.yaml; fi
         if [[ -f /root/hy/hy-client.json ]]; then sed -i "s|\"server\": \"$esc_old_client_ip_f:|\"server\": \"$esc_new_client_ip_f:|g" /root/hy/hy-client.json; fi
-        local escaped_old_ip_url_at="@$(printf '%s\n' "$old_client_ip_f" | sed 's:[][\/.^$*]:\\&:g')" # Simpler, assuming @IP: is unique
+        local escaped_old_ip_url_at="@$(printf '%s\n' "$old_client_ip_f" | sed 's:[][\/.^$*]:\\&:g')" 
         local escaped_new_ip_url_at="@$(printf '%s\n' "$new_client_ip_f" | sed 's:[][\/.^$*]:\\&:g')"
         if [[ -f /root/hy/url.txt ]]; then sed -i "s|$escaped_old_ip_url_at|$escaped_new_ip_url_at|g" /root/hy/url.txt; fi
     fi
@@ -817,7 +819,7 @@ showconf(){
     fi
     if [[ -f /root/hy/url.txt ]]; then
         echo ""; yellow "分享链接 (/root/hy/url.txt):"; local current_url=$(cat /root/hy/url.txt); echo "$current_url"
-        # QR Code removed
+        # QR Code display removed
     fi
 }
 
